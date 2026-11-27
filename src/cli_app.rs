@@ -928,7 +928,8 @@ struct CheckArgs {
     /// a fresh, complete host RAM-scratch assessment without warnings.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
-    /// Desired minimum free percentage.
+    /// Desired minimum free percentage. With --predict, also project when
+    /// free space will reach this floor.
     #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: Option<f64>,
     /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
@@ -17185,8 +17186,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 3: the daemon's forecast (`--predict N`): the mount's
     // `seconds_to_red` from state.json v2, or the rate against the check's
-    // own threshold when the daemon has no red horizon yet. A missing or
-    // stale state file is reported as unknown, never as a number.
+    // own threshold when the daemon has no red horizon yet. An explicit
+    // --target-free floor also needs its own runway even when red is distant.
+    // A missing or stale state file is reported as unknown.
     let mut forecast_json = Value::Null;
     if let Some(predict_minutes) = args.predict {
         let window_secs = predict_minutes as f64 * 60.0;
@@ -17198,23 +17200,33 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         match forecast {
             Ok(forecast) => {
                 forecast_json = forecast.to_json(min_confidence);
-                let seconds_left = forecast.acting_seconds_to_red().or_else(|| {
-                    (forecast.projection_rate() > 0.0).then(|| {
-                        let bytes_until_threshold = capacity.available_bytes.saturating_sub(
-                            (threshold_pct / 100.0 * capacity.total_bytes as f64) as u64,
-                        );
-                        bytes_until_threshold as f64 / forecast.projection_rate()
-                    })
-                });
-                if let Some(seconds_left) = seconds_left
-                    && seconds_left < window_secs
-                {
+                if let Some(failure) = forecast.check_window(
+                    capacity.available_bytes,
+                    capacity.total_bytes,
+                    threshold_pct,
+                    args.target_free.is_some(),
+                    window_secs,
+                ) {
                     let runway_unknown = forecast.runway_unknown();
-                    let reported_seconds = (!runway_unknown).then_some(seconds_left);
+                    let reported_seconds = forecast.acting_seconds_to_red().filter(|_| !runway_unknown);
                     let minutes_left = reported_seconds.map(|seconds| seconds / 60.0);
+                    let (boundary, seconds_left, target_seconds, reason) = match failure {
+                        CheckRunwayFailure::Target(seconds) => (
+                            format!("to reach {threshold_pct}% free"),
+                            seconds,
+                            Some(seconds),
+                            "predicted_free_target_within_window",
+                        ),
+                        CheckRunwayFailure::Red(seconds) => (
+                            "red".to_string(),
+                            seconds,
+                            None,
+                            if runway_unknown { "forecast_runway_unknown" } else { "predicted_red_within_window" },
+                        ),
+                    };
                     match output_mode(cli) {
                         OutputMode::Human => {
-                            if runway_unknown {
+                            if matches!(failure, CheckRunwayFailure::Red(_)) && runway_unknown {
                                 println!(
                                     "sbh: {} has {} free but {}; cannot establish the requested {} min runway",
                                     capacity.mount_point.display(),
@@ -17224,7 +17236,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 );
                             } else {
                                 println!(
-                                    "sbh: {} has {} free but predicted red in {} (need {} min; rate {}/s, confidence {:.2}{})",
+                                    "sbh: {} has {} free but predicted {boundary} in {} (need {} min; rate {}/s, confidence {:.2}{})",
                                     capacity.mount_point.display(),
                                     format_bytes(capacity.available_bytes),
                                     format_eta(seconds_left),
@@ -17244,11 +17256,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "command": "check",
                                 "schema_version": 2,
                                 "status": "warning",
-                                "reason": if runway_unknown {
-                                    "forecast_runway_unknown"
-                                } else {
-                                    "predicted_red_within_window"
-                                },
+                                "reason": reason,
                                 "path": check_path.to_string_lossy(),
                                 "mount_point": capacity.mount_point.to_string_lossy(),
                                 "free_bytes": capacity.available_bytes,
@@ -17258,6 +17266,8 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "seconds_to_red": reported_seconds,
                                 "seconds_to_red_lower_bound": forecast.tte_lo,
                                 "minutes_until_red": minutes_left,
+                                "target_free_pct": threshold_pct,
+                                "seconds_to_target_free": target_seconds,
                                 "runway_unknown": runway_unknown,
                                 "predict_minutes": predict_minutes,
                                 "forecast": forecast_json,
@@ -17278,10 +17288,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         }
                     }
                     return Err(CliError::User(
-                        if runway_unknown {
-                            "forecast cannot establish the requested headroom window"
-                        } else {
-                            "predicted red within window"
+                        match failure {
+                            CheckRunwayFailure::Target(_) => "predicted free space below target within window",
+                            CheckRunwayFailure::Red(_) if runway_unknown => "forecast cannot establish the requested headroom window",
+                            CheckRunwayFailure::Red(_) => "predicted red within window",
                         }
                         .to_string(),
                     ));
@@ -17555,6 +17565,12 @@ fn reclaim_capability_checks_at(
     checks
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CheckRunwayFailure {
+    Red(f64),
+    Target(f64),
+}
+
 /// The daemon's forecast for one mount, as `state.json` v2 `rates` carries it.
 #[derive(Debug, Clone, PartialEq)]
 struct MountForecast {
@@ -17601,6 +17617,39 @@ impl MountForecast {
     fn projection_rate(&self) -> f64 {
         self.forecast_rate_bytes_per_sec
             .unwrap_or(self.bytes_per_sec)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn check_window(
+        &self,
+        available_bytes: u64,
+        total_bytes: u64,
+        threshold_pct: f64,
+        explicit_target: bool,
+        window_secs: f64,
+    ) -> Option<CheckRunwayFailure> {
+        if let Some(red) = self.acting_seconds_to_red() {
+            if red < window_secs {
+                return Some(CheckRunwayFailure::Red(red));
+            }
+            if !explicit_target {
+                return None;
+            }
+        }
+        // A red forecast cannot establish the runway to the operator's
+        // (potentially higher) floor. If red is unknown, keep projecting to
+        // the effective check threshold as on older daemon publications.
+        let rate = self.projection_rate();
+        if rate <= 0.0 {
+            return None;
+        }
+        let floor = (threshold_pct / 100.0 * total_bytes as f64) as u64;
+        let seconds = available_bytes.saturating_sub(floor) as f64 / rate;
+        (seconds < window_secs).then_some(CheckRunwayFailure::Target(seconds))
     }
 
     /// The unadjusted estimate remains useful evidence when calibration
@@ -24410,6 +24459,49 @@ mod tests {
         assert!(line.contains("recovering"), "{line}");
         assert!(line.contains("red in 10m"), "{line}");
         assert!(line.contains("forecast net +"), "{line}");
+    }
+
+    #[test]
+    fn check_predict_gates_the_requested_free_target_and_the_daemons_red_bound() {
+        // 40% free, with the long-term forecast consuming one percentage
+        // point per minute despite a brief freeing sample. Red is 35 min
+        // away, but the operator's 35% floor is only five minutes away.
+        let mut forecast = MountForecast::from_rate(&json!({
+            "bytes_per_sec": -1.0,
+            "forecast_rate_bytes_per_sec": 1.0,
+            "seconds_to_red": 2100.0,
+        }))
+        .unwrap();
+        let check = |forecast: &MountForecast, explicit, window| {
+            forecast.check_window(2400, 6000, 35.0, explicit, window)
+        };
+        assert_eq!(
+            check(&forecast, true, 600.0),
+            Some(CheckRunwayFailure::Target(300.0))
+        );
+        assert_eq!(check(&forecast, true, 300.0), None);
+        assert_eq!(check(&forecast, false, 600.0), None);
+
+        // Retain the independent conservative red gate, including when
+        // calibration gives no positive lower bound or the rate is freeing.
+        forecast.tte_lo = Some(0.0);
+        forecast.forecast_rate_bytes_per_sec = Some(-1.0);
+        assert_eq!(
+            check(&forecast, true, 600.0),
+            Some(CheckRunwayFailure::Red(0.0))
+        );
+        forecast.tte_lo = None;
+        assert_eq!(check(&forecast, true, 600.0), None);
+
+        // A rate-only legacy publication projects to the check threshold.
+        // This estimate is never rendered as a time to the red boundary.
+        forecast.forecast_rate_bytes_per_sec = None;
+        forecast.bytes_per_sec = 1.0;
+        forecast.seconds_to_red = None;
+        assert_eq!(
+            check(&forecast, false, 600.0),
+            Some(CheckRunwayFailure::Target(300.0))
+        );
     }
 
     #[test]
