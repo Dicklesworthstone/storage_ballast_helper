@@ -663,8 +663,8 @@ impl BallastManager {
 
     /// Files in the pool directory whose index is outside `1..=file_count`
     /// (left behind by a smaller `file_count`, or foreign). Reported by status
-    /// and pruned by provisioning under the lock. On Unix, verified surplus
-    /// ballast is also inventoried and may be used for emergency release.
+    /// even when ownership cannot be verified. On Unix, verified surplus
+    /// ballast can be released in an emergency or pruned by provisioning.
     #[must_use]
     pub fn orphans(&self) -> Vec<PathBuf> {
         orphan_ballast_files(&self.ballast_dir, self.config.file_count)
@@ -835,7 +835,10 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
-        let _lock = self.acquire_lock(false)?;
+        #[cfg(unix)]
+        let lock = self.acquire_lock(false)?;
+        #[cfg(not(unix))]
+        self.acquire_lock(false)?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -847,8 +850,9 @@ impl BallastManager {
             created: Vec::new(),
         };
 
-        // Ensure no orphans exist before provisioning.
-        self.prune_orphans();
+        #[cfg(unix)]
+        emergency::prune_surplus(self, &lock)
+            .map_err(|error| SbhError::io(&self.ballast_dir, error))?;
 
         for i in 1..=self.config.file_count {
             let index = i as u32;
@@ -1043,7 +1047,10 @@ impl BallastManager {
         free_pct_check: Option<&dyn Fn() -> f64>,
         control: Option<ProvisionControl<'_>>,
     ) -> Result<ProvisionReport> {
-        let _lock = self.acquire_lock(true)?;
+        #[cfg(unix)]
+        let lock = self.acquire_lock(true)?;
+        #[cfg(not(unix))]
+        self.acquire_lock(true)?;
         if let Some(control) = control {
             control.check(&self.ballast_dir)?;
         }
@@ -1061,8 +1068,10 @@ impl BallastManager {
         // Background growth does not prune surplus reserve. Its configuration
         // may be revoked while a native directory lookup is blocked, and an
         // emergency can still release those independently verified files.
+        #[cfg(unix)]
         if control.is_none() {
-            self.prune_orphans();
+            emergency::prune_surplus(self, &lock)
+                .map_err(|error| SbhError::io(&self.ballast_dir, error))?;
         }
 
         for i in 1..=self.config.file_count {
@@ -1139,14 +1148,6 @@ impl BallastManager {
     }
 
     // ──────────────────── internal ────────────────────
-
-    /// Scan directory for ballast files with index > current file_count and remove them.
-    /// Remove orphaned ballast files. Callers hold the pool lock.
-    fn prune_orphans(&self) {
-        for path in orphan_ballast_files(&self.ballast_dir, self.config.file_count) {
-            let _ = fs::remove_file(&path);
-        }
-    }
 
     fn file_path(&self, index: u32) -> PathBuf {
         self.ballast_dir.join(ballast_file_name(index))
@@ -1591,15 +1592,13 @@ mod tests {
         assert_eq!(report.files_missing, 3);
         assert!(orphan_hi.exists(), "verify never prunes");
 
-        // provision() prunes under the lock and leaves unrelated files alone.
+        // Neither a lookalike filename nor index zero proves sbh ownership.
         let report = mgr.provision(None).unwrap();
         assert_eq!(report.files_created, 3, "{report:?}");
-        assert!(
-            !orphan_hi.exists() && !orphan_zero.exists(),
-            "provision prunes orphans"
-        );
+        assert_eq!(fs::read(&orphan_hi).unwrap(), b"stale");
+        assert_eq!(fs::read(&orphan_zero).unwrap(), b"stale");
         assert!(pool.join("unrelated.dat").exists());
-        assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+        assert_eq!(mgr.orphans(), vec![orphan_zero, orphan_hi]);
 
         // verify() on a missing pool reports all-missing and still creates nothing.
         let mut absent = BallastManager::new(missing.clone(), small_config()).unwrap();
@@ -2069,17 +2068,11 @@ mod tests {
         );
         assert_eq!(mgr.orphans(), vec![file4.clone(), file5.clone()]);
 
-        // The next provision prunes them under the lock.
+        // Unix can bind the verified old slots to the locked directory. The
+        // portable backend retains them when it cannot prove that identity.
         mgr.provision(None).unwrap();
-        assert!(
-            !file4.exists(),
-            "Orphaned file 4 should be removed by provision"
-        );
-        assert!(
-            !file5.exists(),
-            "Orphaned file 5 should be removed by provision"
-        );
-        assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+        assert_eq!(file4.exists(), !cfg!(unix));
+        assert_eq!(file5.exists(), !cfg!(unix));
         assert_eq!(mgr.available_count(), 3);
     }
 

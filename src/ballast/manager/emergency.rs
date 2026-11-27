@@ -183,28 +183,28 @@ mod unix {
                 owner_pid: std::process::id(),
             }))
         }
+    }
 
-        fn remove(
-            &self,
-            name: &OsStr,
-            expected: &Metadata,
-            still_allowed: &dyn Fn() -> bool,
-        ) -> io::Result<bool> {
-            // Reject a replacement before unlinking. The flock serializes
-            // cooperative manager writes; the opened directory prevents a
-            // renamed parent from redirecting the operation into another tree.
-            let current = open_regular(&self.directory, name)?;
-            if !same_file(expected, &current.metadata()?) {
-                return Err(invalid("ballast slot changed during the release pass"));
-            }
-            // Native identity reads can stall. Consent captured before them
-            // cannot authorize a later unlink after cancellation or reload.
-            if !still_allowed() {
-                return Ok(false);
-            }
-            unlinkat(&self.directory, name, AtFlags::empty())?;
-            Ok(true)
+    fn remove_current(
+        directory: &File,
+        name: &OsStr,
+        expected: &Metadata,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
+        // Reject a replacement before unlinking. The flock serializes
+        // cooperative manager writes; the opened directory prevents a
+        // renamed parent from redirecting the operation into another tree.
+        let current = open_regular(directory, name)?;
+        if !same_file(expected, &current.metadata()?) {
+            return Err(invalid("ballast slot changed during the release pass"));
         }
+        // Native identity reads can stall. Consent captured before them
+        // cannot authorize a later unlink after cancellation or reload.
+        if !still_allowed() {
+            return Ok(false);
+        }
+        unlinkat(directory, name, AtFlags::empty())?;
+        Ok(true)
     }
 
     fn verify_open_file(file: &mut File, meta: &Metadata, index: u32, size: u64) -> bool {
@@ -222,6 +222,39 @@ mod unix {
         serde_json::from_slice::<BallastHeader>(&bytes[..end]).is_ok_and(|header| {
             header.validate() && header.file_index == index && header.file_size == size
         }) && file.metadata().is_ok_and(|after| same_file(meta, &after))
+    }
+
+    /// Explicit provision may shrink an old pool. A status orphan is only a
+    /// filename hint, so apply the same ownership checks as surplus release.
+    pub(in super::super) fn prune_surplus(
+        manager: &BallastManager,
+        held_lock: &File,
+    ) -> io::Result<()> {
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&manager.ballast_dir)?;
+        let named_lock = open_regular(&directory, OsStr::new(".lock"))?;
+        if !same_file(&held_lock.metadata()?, &named_lock.metadata()?) {
+            return Err(invalid(
+                "ballast directory no longer owns the provision lock",
+            ));
+        }
+        for index in existing_indices(&manager.ballast_dir, &directory.metadata()?)? {
+            if index as usize <= manager.config.file_count {
+                continue;
+            }
+            let name = ballast_file_name(index);
+            let name = OsStr::new(&name);
+            let Ok(mut file) = open_regular(&directory, name) else {
+                continue;
+            };
+            let meta = file.metadata()?;
+            if verify_open_file(&mut file, &meta, index, meta.len()) {
+                remove_current(&directory, name, &meta, &|| true)?;
+            }
+        }
+        Ok(())
     }
 
     pub(in super::super) fn release(
@@ -294,7 +327,7 @@ mod unix {
             // delta: CoW snapshots can still retain blocks after unlink.
             let size = meta.len().min(meta.blocks().saturating_mul(512));
             if report.files_released < count && !revoked {
-                match guard.remove(OsStr::new(&name), &meta, still_allowed) {
+                match remove_current(&guard.directory, OsStr::new(&name), &meta, still_allowed) {
                     Ok(true) => {
                         report.files_released += 1;
                         report.bytes_freed = report.bytes_freed.saturating_add(size);
@@ -678,7 +711,7 @@ mod unix {
             fs::rename(&path, manager.ballast_dir.join("previous")).unwrap();
             fs::write(&path, b"replacement").unwrap();
             let name = path.file_name().unwrap();
-            assert!(guard.remove(name, &meta, &|| true).is_err());
+            assert!(remove_current(&guard.directory, name, &meta, &|| true).is_err());
             assert_eq!(fs::read(&path).unwrap(), b"replacement");
         }
 
@@ -705,12 +738,61 @@ mod unix {
             fs::create_dir(&manager.ballast_dir).unwrap();
             fs::write(&path, b"new directory's contents").unwrap();
             assert!(
-                guard
-                    .remove(path.file_name().unwrap(), &meta, &|| true)
+                remove_current(&guard.directory, path.file_name().unwrap(), &meta, &|| true)
                     .unwrap()
             );
             assert_eq!(fs::read(path).unwrap(), b"new directory's contents");
             assert!(!moved.join(ballast_file_name(3)).exists());
+        }
+
+        #[test]
+        fn maintenance_prunes_only_verified_old_slots() {
+            for gradual in [false, true] {
+                let (root, mut manager) = fixture();
+                let external = root.path().join("external");
+                fs::write(&external, b"keep both links").unwrap();
+                fs::hard_link(&external, manager.file_path(4)).unwrap();
+                symlink(&external, manager.file_path(5)).unwrap();
+                let alias = manager.ballast_dir.join("SBH_BALLAST_FILE_6.DAT");
+                fs::write(&alias, b"lookalike").unwrap();
+                // The slot 3 header is valid but does not belong to index 7.
+                fs::copy(manager.file_path(3), manager.file_path(7)).unwrap();
+                let mut changed = config();
+                changed.file_count = 1;
+                changed.file_size_bytes *= 2;
+                manager.update_config(changed);
+
+                let report = if gradual {
+                    manager.replenish_one(None).unwrap()
+                } else {
+                    manager.provision(None).unwrap()
+                };
+                assert!(report.errors.is_empty(), "{report:?}");
+                assert_eq!(report.files_created, 1, "{report:?}");
+                for index in [2, 3] {
+                    assert!(!manager.file_path(index).exists());
+                }
+                assert_eq!(fs::metadata(&external).unwrap().nlink(), 2);
+                assert!(
+                    fs::symlink_metadata(manager.file_path(5))
+                        .unwrap()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(alias).unwrap(), b"lookalike");
+                assert!(manager.file_path(7).is_file());
+            }
+        }
+
+        #[test]
+        fn replacing_the_locked_pool_does_not_authorize_pruning_its_replacement() {
+            let (root, mut manager) = fixture();
+            let other = fixture();
+            manager.config.file_count = 1;
+            let lock = manager.acquire_lock(false).unwrap();
+            fs::rename(&manager.ballast_dir, root.path().join("old-pool")).unwrap();
+            fs::rename(&other.1.ballast_dir, &manager.ballast_dir).unwrap();
+            assert!(prune_surplus(&manager, &lock).is_err());
+            assert!(manager.file_path(3).exists());
         }
 
         #[test]
@@ -902,7 +984,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(super) use unix::release;
+pub(super) use unix::{prune_surplus, release};
 
 // Preserve the portable manager behavior on non-Unix targets. The no-allocation
 // and nonblocking-flock contract above is for the supported Unix daemon hosts.
