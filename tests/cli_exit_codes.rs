@@ -446,6 +446,56 @@ fn clean_and_emergency_with_nothing_to_reclaim_are_exit_zero() {
     assert_eq!(payload["candidates_count"], 0);
 }
 
+/// An overlapping scan root can reveal source that an opaque target's
+/// classification never saw. The complete emergency plan must honor it.
+#[cfg(target_os = "linux")]
+#[test]
+fn emergency_preserves_an_opaque_target_with_a_separately_observed_veto() {
+    use std::collections::BTreeSet;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = config_in(directory.path());
+    let root = directory.path().join("root").canonicalize().unwrap();
+    let enclosing = root.join("enclosing-target");
+    let peer = root.join("peer-target");
+    for target in [&enclosing, &peer] {
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::create_dir_all(target.join("debug/incremental")).unwrap();
+        fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    }
+    let nested = enclosing.join("debug/deps/snapshot/captured");
+    let source = nested.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.rs"), "fn main() {}").unwrap();
+
+    let planned = |roots: &[&Path]| {
+        // A zero target lets us inspect admission while every file stays put.
+        let mut args = vec![
+            "--json",
+            "emergency",
+            "--yes",
+            "--target-free",
+            "0",
+            "--min-age",
+            "0",
+        ];
+        args.extend(roots.iter().map(|path| path.to_str().unwrap()));
+        let output = sbh(&config, &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["items_deleted"], 0, "{report}");
+        report["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| PathBuf::from(candidate["path"].as_str().unwrap()))
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(planned(&[&root]), BTreeSet::from([enclosing, peer.clone()]));
+    assert_eq!(planned(&[&root, &nested]), BTreeSet::from([peer]));
+    assert_eq!(fs::read(source.join("keep.rs")).unwrap(), b"fn main() {}");
+}
+
 /// A scan with no eligible artifacts can prove success, or report a pressure
 /// condition, from current capacity. The default remains best effort.
 #[test]

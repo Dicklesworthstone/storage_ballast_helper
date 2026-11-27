@@ -18699,7 +18699,6 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             score.identity = Some(entry.metadata.identity());
             Some(score)
         })
-        .filter(|score| !score.vetoed)
         .collect();
 
     let scan_elapsed = start.elapsed();
@@ -18724,7 +18723,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
-    let plan = executor.plan(scored);
+    // A child or alias can carry the veto that protects a whole deletion scope.
+    // Admit the complete walk before applying emergency Review eligibility.
+    let plan = executor.plan(admit_candidates(scored));
 
     if plan.candidates.is_empty() {
         if output_mode(cli) == OutputMode::Human {
