@@ -519,6 +519,14 @@ impl BallastReplenishment {
     }
 
     pub(crate) fn run(&mut self, still_allowed: &dyn Fn() -> bool) -> Result<ProvisionReport> {
+        self.run_with_headroom(still_allowed, None)
+    }
+
+    fn run_with_headroom(
+        &mut self,
+        still_allowed: &dyn Fn() -> bool,
+        free_pct_check: Option<&dyn Fn() -> f64>,
+    ) -> Result<ProvisionReport> {
         let mount = self.pool.mount_point.clone();
         let directory = self.pool.ballast_dir.clone();
         let device = self.pool.refill_device;
@@ -537,7 +545,7 @@ impl BallastReplenishment {
         // the provisioner may allocate or repair the next chunk.
         let allowed = || still_allowed() && scope_current() && still_allowed();
         let mut result = if self.initial_provision {
-            provision::provision_guarded(&mut self.pool, None, &allowed)
+            provision::provision_guarded(&mut self.pool, free_pct_check, &allowed)
         } else {
             provision::replenish_one_guarded(&mut self.pool, &allowed)
         };
@@ -1488,7 +1496,8 @@ impl BallastPoolCoordinator {
         let mut per_volume = Vec::new();
         let mut skipped_volumes = Vec::new();
 
-        for (mount_path, pool) in &mut self.pools {
+        let mounts: Vec<_> = self.pools.keys().cloned().collect();
+        for mount_path in &mounts {
             if stopped() {
                 skipped_volumes.push((
                     mount_path.clone(),
@@ -1505,25 +1514,30 @@ impl BallastPoolCoordinator {
             // Live probe for the manager's per-file headroom admission. There
             // is no wholesale refusal here: a low-but-not-critical volume gets
             // a partial reserve instead of none.
-            let mount_path_clone = mount_path.clone();
-            let platform_ref = platform;
             // A stop request admits no further file: the manager treats
             // zero headroom as "refuse the next file" and returns.
-            let free_check = move || -> f64 {
+            let free_check = || -> f64 {
                 if stopped() {
                     return 0.0;
                 }
-                platform_ref
-                    .fs_stats(&mount_path_clone)
-                    .map_or(0.0, |s| s.free_pct())
+                platform.fs_stats(mount_path).map_or(0.0, |s| s.free_pct())
             };
 
             // An explicit CLI provision retains the synchronous manager's
             // repair/prune behavior. Daemon startup uses cancellable growth,
             // which preserves surplus reserve while its authority can change.
             let result = if stop.is_some() {
-                provision::provision_guarded(pool, Some(&free_check), &|| !stopped())
+                // Synchronous startup has the same device and publication
+                // requirements as background startup. Keep its additional
+                // mount headroom probe when running the shared actuator.
+                let mut task = self
+                    .prepare_initial_provision(mount_path)
+                    .expect("mount selected from current pools");
+                let result = task.run_with_headroom(&|| !stopped(), Some(&free_check));
+                self.finish_replenishment(task);
+                result
             } else {
+                let pool = self.pools.get_mut(mount_path).expect("current pool");
                 provision::provision(pool, Some(&free_check))
             };
             match result {
@@ -3846,6 +3860,30 @@ mod tests {
             assert_eq!(fs::read(file).unwrap(), b"foreign damaged reserve");
             assert!(!directory.join(".lock").exists());
             assert!(!coordinator.finish_replenishment(refill));
+        }
+
+        #[test]
+        fn synchronous_startup_rejects_changed_device_and_provisions_healthy_peer() {
+            let (temp, platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let pool = coordinator.pools.get_mut(&mount).unwrap();
+            pool.refill_device = Some(pool.refill_device.unwrap() ^ 1);
+            let directory = pool.ballast_dir.clone();
+            fs::create_dir_all(&directory).unwrap();
+            let damaged = directory.join("SBH_BALLAST_FILE_00001.dat");
+            fs::write(&damaged, b"existing damaged reserve").unwrap();
+
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let report = coordinator.provision_all_until(&platform, &stop).unwrap();
+            assert!(report.skipped_volumes.iter().any(|(path, reason)| {
+                path == &mount && reason.contains("discovered filesystem")
+            }));
+            assert_eq!(fs::read(damaged).unwrap(), b"existing damaged reserve");
+            assert!(!directory.join(".lock").exists());
+            assert_eq!(coordinator.pool_for_mount(&mount).unwrap().available_count(), 0);
+            assert_eq!(report.total_files_created(), 3);
+            let peer = coordinator.pool_for_mount(&temp.path().join("second")).unwrap();
+            assert_eq!(peer.available_count(), 3);
         }
 
         #[test]
