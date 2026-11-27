@@ -36,6 +36,7 @@ struct AdmittedRoot {
 pub struct RamReclaimRequest {
     mount: PathBuf,
     device_id: u64,
+    target_bytes: u64,
     remaining: Arc<AtomicU64>,
     roots: Vec<AdmittedRoot>,
 }
@@ -76,6 +77,7 @@ impl RamReclaimRequest {
         Self {
             mount,
             device_id,
+            target_bytes,
             remaining: Arc::new(AtomicU64::new(target_bytes)),
             roots,
         }
@@ -101,6 +103,16 @@ impl RamReclaimRequest {
                 .fetch_min(self.remaining_bytes(), Ordering::AcqRel);
             self.remaining = Arc::clone(&previous.remaining);
         }
+    }
+
+    /// Distinguish independent tmpfs-pressure objectives in the scan pacing
+    /// ledger. Unlike the mutable shared allowance, the original target is
+    /// stable for the lifetime of this pass.
+    pub(super) fn same_scan_scope(&self, other: &Self) -> bool {
+        self.mount == other.mount
+            && self.device_id == other.device_id
+            && self.target_bytes == other.target_bytes
+            && self.roots == other.roots
     }
 
     /// Renew the admitted root's original alias, canonical directory identity,
