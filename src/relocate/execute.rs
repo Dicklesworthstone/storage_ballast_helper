@@ -226,17 +226,6 @@ fn run(mut command: Command, stage: &str) -> Result<String, (String, String)> {
     }
 }
 
-/// Copy `source/` to `destination` and prove the copy identical.
-fn copy_and_verify(
-    config: &RelocationConfig,
-    remote: bool,
-    source: &str,
-    destination: &str,
-) -> Result<(), (String, String)> {
-    copy_tree(config, remote, source, destination)?;
-    verify_copy(config, remote, source, destination)
-}
-
 fn copy_tree(
     config: &RelocationConfig,
     remote: bool,
@@ -1722,17 +1711,31 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     }
     // Pin the payload itself, not just its parent: replacing the payload
     // entry with a symlink must never redirect even the initial rsync writes.
-    let destination = format!("/proc/{}/fd/{}/", std::process::id(), payload.as_raw_fd());
-    copy_and_verify(
-        &config,
-        is_remote(&record.destination),
-        &record.destination,
-        &destination,
-    )
-    .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
+    let destination = format!("{}/", descriptor_path(&payload).display());
+    let remote = is_remote(&record.destination);
+    copy_tree(&config, remote, &record.destination, &destination)
+        .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
+    // Pin the staged contents *before* checksums: an edit to an entry that
+    // rsync already checked must not become the baseline for publication.
+    // Older records carry no relocation entry limit. Restore verifies the
+    // entire tree, with the fingerprint's depth and working-memory limits.
+    let capture_payload = || SourceEvidence::capture(&payload, u64::MAX);
+    let evidence = capture_payload().map_err(|error| retained(error.to_string()))?;
+    verify_copy(&config, remote, &record.destination, &destination)
+        .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
+    let check_payload = || -> io::Result<()> {
+        if evidence.matches(&capture_payload()?, false) {
+            Ok(())
+        } else {
+            Err(restore_invalid(
+                "copied tree was replaced or changed after verification",
+            ))
+        }
+    };
     if let Some(hook) = hooks.before_swap {
         hook(stub, &workspace.location());
     }
+    check_payload().map_err(|error| retained(error.to_string()))?;
     let current = restore_snapshot(&locked).map_err(|error| retained(error.to_string()))?;
     if !same_restore_stamp(&initial.directory, &current.directory)
         || !initial.same_contents(&current)
@@ -1780,6 +1783,7 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     if let Some(hook) = hooks.after_stub_move {
         hook(stub, &workspace.location());
     }
+    check_payload().map_err(|error| undo(error.to_string()))?;
     // Rename changes the directory ctime. Its identity and entries must
     // still match, including the record read before the transfer started.
     let moved = fs::File::from(
@@ -1944,13 +1948,9 @@ mod tests {
             let sidecar = PathBuf::from(format!("{}{RECORD_FILENAME}", copy.display()));
             let mut ledger = Ledger::default();
             let previous_inode = if resume {
-                copy_and_verify(
-                    &config,
-                    false,
-                    &format!("{}/", unit.display()),
-                    &destination,
-                )
-                .unwrap();
+                let source = format!("{}/", unit.display());
+                copy_tree(&config, false, &source, &destination).unwrap();
+                verify_copy(&config, false, &source, &destination).unwrap();
                 ledger.in_progress.insert(unit.clone(), destination.clone());
                 Some(fs::metadata(copy.join("a/b/data")).unwrap().ino())
             } else {
@@ -3293,6 +3293,47 @@ mod tests {
                 b"verified backup payload"
             );
             assert!(error.contains(&workspace.borrow().display().to_string()));
+        }
+    }
+
+    #[test]
+    fn restore_keeps_the_stub_when_verified_descendants_change() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for after_move in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, backup) = restore_fixture(tmp.path());
+            fs::create_dir(backup.join("nested")).unwrap();
+            fs::write(backup.join("nested/file"), b"saved").unwrap();
+            let retained = std::cell::RefCell::new(PathBuf::new());
+            let edit = |_: &Path, staging: &Path| {
+                let file = staging.join("payload/nested/file");
+                // Edit in place with the same length. The payload directory,
+                // its immediate entries and the edited inode all retain their
+                // identities. Set a distinct mtime even on coarse clocks.
+                fs::write(&file, b"other").unwrap();
+                filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+                *retained.borrow_mut() = file;
+            };
+            let hooks = if after_move {
+                RestoreHooks {
+                    after_stub_move: Some(&edit),
+                    ..RestoreHooks::default()
+                }
+            } else {
+                RestoreHooks {
+                    before_swap: Some(&edit),
+                    ..RestoreHooks::default()
+                }
+            };
+            let error = restore_with_hooks(&stub, &hooks).unwrap_err();
+            assert!(error.contains("changed after verification"), "{error}");
+            assert!(stub.join(RECORD_FILENAME).is_file());
+            assert!(!stub.join("nested").exists());
+            assert_eq!(fs::read(backup.join("nested/file")).unwrap(), b"saved");
+            assert_eq!(fs::read(&*retained.borrow()).unwrap(), b"other");
         }
     }
 
