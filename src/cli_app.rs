@@ -793,6 +793,10 @@ struct EmergencyArgs {
     /// Target free percentage to recover immediately.
     #[arg(long, default_value_t = 10.0, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: f64,
+    /// Return a nonzero exit status unless every requested path's byte target
+    /// is verified after cleanup. An inode target already requires verification.
+    #[arg(long)]
+    require_target: bool,
     /// Also recover this percentage of available filesystem inodes. Requires
     /// finite inode accounting; stops only when both recovery targets are met.
     #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
@@ -812,6 +816,7 @@ impl Default for EmergencyArgs {
         Self {
             paths: Vec::new(),
             target_free: 10.0,
+            require_target: false,
             target_free_inodes: None,
             yes: false,
             min_age: 5,
@@ -17974,17 +17979,26 @@ fn emergency_pressure_skip(
     path: &Path,
     args: &EmergencyArgs,
 ) -> Option<SkipReason> {
-    let Some(target_inodes) = args.target_free_inodes else {
+    let target_inodes = args.target_free_inodes;
+    if target_inodes.is_none() && !args.require_target {
         return target_free_skip(collector, path, args.target_free);
-    };
-    if !(0.0..=100.0).contains(&args.target_free) || !(0.0..=100.0).contains(&target_inodes) {
+    }
+    if !(0.0..=100.0).contains(&args.target_free)
+        || target_inodes.is_some_and(|target| !(0.0..=100.0).contains(&target))
+    {
         return Some(SkipReason::PressureUnavailable);
     }
-    let Ok((stats, inodes)) = emergency_inode_snapshot(collector, platform, path) else {
+    let Ok((stats, inodes)) =
+        emergency_capacity_snapshot(collector, platform, path, target_inodes.is_some(), None)
+    else {
         return Some(SkipReason::PressureUnavailable);
     };
     (stats.free_pct() >= args.target_free
-        && inodes.available >= emergency_inode_target(inodes.total, target_inodes))
+        && target_inodes.is_none_or(|percentage| {
+            inodes.is_some_and(|counts| {
+                counts.available >= emergency_inode_target(counts.total, percentage)
+            })
+        }))
     .then_some(SkipReason::TargetFreeReached)
 }
 
@@ -18004,13 +18018,15 @@ fn emergency_inode_target(total: u64, percentage: f64) -> u64 {
     }
 }
 
-/// Bind fresh byte and inode readings to the same live filesystem. Neither a
-/// cached low reading nor a replaced path can authorize an inode-only unlink.
-fn emergency_inode_snapshot(
+/// Bind the requested capacity readings to the same live filesystem. A
+/// byte-only goal needs no inode probe, including on dynamic-inode filesystems.
+fn emergency_capacity_snapshot(
     collector: &FsStatsCollector,
     platform: &dyn Platform,
     path: &Path,
-) -> Result<(FsStats, InodeStats), String> {
+    include_inodes: bool,
+    expected: Option<&(PathBuf, FsIdentity)>,
+) -> Result<(FsStats, Option<InodeStats>), String> {
     use storage_ballast_helper::scanner::walker::identity_for_path;
 
     let resolved = path
@@ -18018,6 +18034,9 @@ fn emergency_inode_snapshot(
         .map_err(|error| format!("cannot resolve recovery path: {error}"))?;
     let identity = identity_for_path(&resolved, false)
         .map_err(|error| format!("cannot identify recovery path: {error}"))?;
+    if expected.is_some_and(|(original, object)| original != &resolved || object != &identity) {
+        return Err("requested path changed since emergency recovery began".into());
+    }
     collector.invalidate_observations();
     let before = collector
         .collect(path)
@@ -18028,45 +18047,90 @@ fn emergency_inode_snapshot(
         .map_err(|error| format!("cannot resolve filesystem owner: {error}"))?;
     let owner = identity_for_path(&owner_path, false)
         .map_err(|error| format!("cannot identify filesystem owner: {error}"))?;
+    // APFS firmlinks can give the queried path and its owning mount different
+    // spellings (e.g. /Users and /System/Volumes/Data/Users).
+    let lookup = |path: &Path| {
+        platform
+            .observe_mount_lookup_path(path)
+            .map_err(|error| format!("cannot resolve filesystem namespace: {error}"))
+    };
     if before.is_readonly
         || before.total_bytes == 0
         || before.available_bytes > before.free_bytes
         || before.free_bytes > before.total_bytes
         || identity.device_id != owner.device_id
-        || !resolved.starts_with(&owner_path)
+        || !lookup(&resolved)?.starts_with(lookup(&owner_path)?)
     {
         return Err("filesystem is read-only or its capacity/ownership is inconsistent".into());
     }
-    let inodes = platform
-        .inode_stats(&resolved)
-        .map_err(|error| format!("inode capacity unavailable: {error}"))?
-        .and_then(InodeStats::validated)
-        .ok_or_else(|| "finite, consistent inode accounting is unavailable".to_string())?;
-    collector.invalidate_observations();
-    let after = collector
-        .collect(path)
-        .map_err(|error| format!("cannot renew filesystem capacity: {error}"))?;
-    if after.is_readonly
-        || after.total_bytes != before.total_bytes
-        || after.fs_type != before.fs_type
-        || after.mount_point != before.mount_point
-        || after.available_bytes > after.free_bytes
-        || after.free_bytes > after.total_bytes
-        || path.canonicalize().ok().as_ref() != Some(&resolved)
+    let (stats, inodes) = if include_inodes {
+        let inodes = platform
+            .inode_stats(&resolved)
+            .map_err(|error| format!("inode capacity unavailable: {error}"))?
+            .and_then(InodeStats::validated)
+            .ok_or_else(|| "finite, consistent inode accounting is unavailable".to_string())?;
+        collector.invalidate_observations();
+        let after = collector
+            .collect(path)
+            .map_err(|error| format!("cannot renew filesystem capacity: {error}"))?;
+        if after.is_readonly
+            || after.total_bytes != before.total_bytes
+            || after.fs_type != before.fs_type
+            || after.mount_point != before.mount_point
+            || after.available_bytes > after.free_bytes
+            || after.free_bytes > after.total_bytes
+        {
+            return Err("filesystem capacity changed during recovery observation".into());
+        }
+        (after, Some(inodes))
+    } else {
+        (before, None)
+    };
+    if path.canonicalize().ok().as_ref() != Some(&resolved)
         || identity_for_path(&resolved, false).ok() != Some(identity)
-        || before.mount_point.canonicalize().ok().as_ref() != Some(&owner_path)
+        || stats.mount_point.canonicalize().ok().as_ref() != Some(&owner_path)
         || identity_for_path(&owner_path, false).ok() != Some(owner)
     {
         return Err("filesystem identity or capacity changed during recovery observation".into());
     }
-    Ok((after, inodes))
+    Ok((stats, inodes))
+}
+
+/// Keep the requested spelling and the object it identified before any
+/// quarantine or scanner work. A replacement cannot satisfy that request.
+struct EmergencyRecoveryRoot {
+    requested: PathBuf,
+    binding: Result<(PathBuf, FsIdentity), String>,
+}
+
+fn capture_emergency_roots(paths: &[PathBuf]) -> Vec<EmergencyRecoveryRoot> {
+    use storage_ballast_helper::scanner::walker::identity_for_path;
+
+    let mut seen = HashSet::new();
+    paths
+        .iter()
+        .filter(|path| seen.insert(path.as_path()))
+        .map(|path| {
+            let binding = path.canonicalize().and_then(|resolved| {
+                let identity = identity_for_path(&resolved, false)?;
+                Ok((resolved, identity))
+            });
+            EmergencyRecoveryRoot {
+                requested: path.clone(),
+                binding: binding.map_err(|error| error.to_string()),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
 struct EmergencyRecoveryGoal {
     path: PathBuf,
     target_free_pct: f64,
-    target_free_inodes_pct: f64,
+    target_free_inodes_pct: Option<f64>,
+    required: bool,
+    available_bytes: Option<u64>,
+    total_bytes: Option<u64>,
     free_pct: Option<f64>,
     total_inodes: Option<u64>,
     available_inodes: Option<u64>,
@@ -18076,23 +18140,22 @@ struct EmergencyRecoveryGoal {
 }
 
 fn emergency_recovery_goals(
-    roots: &[PathBuf],
+    roots: &[EmergencyRecoveryRoot],
     args: &EmergencyArgs,
     collector: &FsStatsCollector,
     platform: &dyn Platform,
 ) -> Vec<EmergencyRecoveryGoal> {
-    let Some(target_inodes) = args.target_free_inodes else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
+    let target_inodes = args.target_free_inodes;
     roots
         .iter()
-        .filter(|root| seen.insert((*root).clone()))
         .map(|root| {
             let mut goal = EmergencyRecoveryGoal {
-                path: root.clone(),
+                path: root.requested.clone(),
                 target_free_pct: args.target_free,
                 target_free_inodes_pct: target_inodes,
+                required: args.require_target || target_inodes.is_some(),
+                available_bytes: None,
+                total_bytes: None,
                 free_pct: None,
                 total_inodes: None,
                 available_inodes: None,
@@ -18100,20 +18163,39 @@ fn emergency_recovery_goals(
                 targets_met: false,
                 issue: None,
             };
-            if !(0.0..=100.0).contains(&args.target_free) || !(0.0..=100.0).contains(&target_inodes)
+            if !(0.0..=100.0).contains(&args.target_free)
+                || target_inodes.is_some_and(|target| !(0.0..=100.0).contains(&target))
             {
                 goal.issue = Some("recovery percentages must be finite and within 0..=100".into());
                 return goal;
             }
-            match emergency_inode_snapshot(collector, platform, root) {
+            let binding = match &root.binding {
+                Ok(binding) => binding,
+                Err(error) => {
+                    goal.issue = Some(error.clone());
+                    return goal;
+                }
+            };
+            let observed = emergency_capacity_snapshot(
+                collector,
+                platform,
+                &root.requested,
+                target_inodes.is_some(),
+                Some(binding),
+            );
+            match observed {
                 Ok((stats, inodes)) => {
-                    let target = emergency_inode_target(inodes.total, target_inodes);
+                    goal.available_bytes = Some(stats.available_bytes);
+                    goal.total_bytes = Some(stats.total_bytes);
                     goal.free_pct = Some(stats.free_pct());
-                    goal.total_inodes = Some(inodes.total);
-                    goal.available_inodes = Some(inodes.available);
-                    goal.target_available_inodes = Some(target);
-                    goal.targets_met =
-                        stats.free_pct() >= args.target_free && inodes.available >= target;
+                    goal.targets_met = stats.free_pct() >= args.target_free;
+                    if let (Some(inodes), Some(percentage)) = (inodes, target_inodes) {
+                        let target = emergency_inode_target(inodes.total, percentage);
+                        goal.total_inodes = Some(inodes.total);
+                        goal.available_inodes = Some(inodes.available);
+                        goal.target_available_inodes = Some(target);
+                        goal.targets_met &= inodes.available >= target;
+                    }
                 }
                 Err(issue) => goal.issue = Some(issue),
             }
@@ -18275,6 +18357,7 @@ fn drain_emergency_quarantine(
 }
 
 /// Obtain the executor's report defaults without a process sweep or mutation.
+#[cfg(test)]
 fn empty_emergency_report() -> DeletionReport {
     let executor = DeletionExecutor::new(
         DeletionConfig {
@@ -18323,7 +18406,7 @@ fn finish_emergency_report(
                         "  Recovery on {}: unverified ({issue}).",
                         goal.path.display()
                     );
-                } else {
+                } else if goal.target_free_inodes_pct.is_some() {
                     println!(
                         "  Recovery on {}: {:.2}% bytes free (target {:.2}%), {} / {} inodes available (target {}); targets {}.",
                         goal.path.display(),
@@ -18332,6 +18415,14 @@ fn finish_emergency_report(
                         goal.available_inodes.unwrap_or_default(),
                         goal.total_inodes.unwrap_or_default(),
                         goal.target_available_inodes.unwrap_or_default(),
+                        if goal.targets_met { "met" } else { "unmet" },
+                    );
+                } else {
+                    println!(
+                        "  Recovery on {}: {:.2}% bytes free (target {:.2}%, {}).",
+                        goal.path.display(),
+                        goal.free_pct.unwrap_or_default(),
+                        goal.target_free_pct,
                         if goal.targets_met { "met" } else { "unmet" },
                     );
                 }
@@ -18372,7 +18463,10 @@ fn emergency_completion_result(
             "user cancelled — no items deleted".to_string(),
         ));
     }
-    if goals.iter().any(|goal| goal.issue.is_some()) {
+    if goals
+        .iter()
+        .any(|goal| goal.required && goal.issue.is_some())
+    {
         let message = "emergency recovery targets could not be verified; inspect the per-filesystem recovery report".to_string();
         return Err(if report.items_deleted > 0 {
             CliError::Partial(message)
@@ -18380,7 +18474,7 @@ fn emergency_completion_result(
             CliError::Runtime(message)
         });
     }
-    if goals.iter().any(|goal| !goal.targets_met) {
+    if goals.iter().any(|goal| goal.required && !goal.targets_met) {
         let message =
             "emergency recovery targets remain unmet; no more eligible artifacts were reclaimed"
                 .to_string();
@@ -18411,11 +18505,16 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         args.paths.clone()
     };
 
+    // Walk the initially resolved roots. Reobserve the operator's original
+    // paths when reporting, so a moved or lost alias cannot inherit an old
+    // target's healthy reading.
+    let recovery_roots = capture_emergency_roots(&raw_roots);
     let mut root_paths = Vec::new();
-    for path in raw_roots {
-        match path.canonicalize() {
-            Ok(resolved) => root_paths.push(resolved),
-            Err(error) if args.target_free_inodes.is_some() => {
+    for root in &recovery_roots {
+        let path = &root.requested;
+        match &root.binding {
+            Ok((resolved, _)) => root_paths.push(resolved.clone()),
+            Err(error) if args.require_target || args.target_free_inodes.is_some() => {
                 return Err(CliError::Runtime(format!(
                     "cannot verify emergency recovery path {}: {error}",
                     path.display(),
@@ -18583,11 +18682,11 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored."
             );
         }
-        let goals = emergency_recovery_goals(&root_paths, args, &collector, platform.as_ref());
+        let goals = emergency_recovery_goals(&recovery_roots, args, &collector, platform.as_ref());
         return finish_emergency_report(
             cli,
             &plan,
-            empty_emergency_report(),
+            executor.execute(&plan, None),
             &quarantine,
             dir_count,
             scan_elapsed,
@@ -18646,7 +18745,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             report.items_failed.saturating_add(quarantine.errors.len()),
         )
     });
-    let goals = emergency_recovery_goals(&root_paths, args, &collector, platform.as_ref());
+    let goals = emergency_recovery_goals(&recovery_roots, args, &collector, platform.as_ref());
     finish_emergency_report(
         cli,
         &plan,
@@ -22957,6 +23056,97 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn emergency_goal_refuses_replaced_requested_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let root = parent.join("work");
+        let peer = parent.join("peer");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&peer).unwrap();
+        let alias = parent.join("active");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let roots = capture_emergency_roots(&[root.clone(), alias.clone(), peer.clone()]);
+        let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&parent));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::ZERO);
+        let args = EmergencyArgs {
+            require_target: true,
+            ..EmergencyArgs::default()
+        };
+        // A new directory occupies the old lexical path and a new symlink
+        // selects the healthy peer. Both readings could otherwise look good.
+        std::fs::rename(&root, parent.join("old")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let replacement = parent.join("new-link");
+        std::os::unix::fs::symlink(&peer, &replacement).unwrap();
+        std::fs::rename(replacement, &alias).unwrap();
+        let goals = emergency_recovery_goals(&roots, &args, &collector, platform.as_ref());
+        assert_eq!(goals.len(), 3);
+        for goal in &goals[..2] {
+            assert!(!goal.targets_met);
+            assert!(goal.issue.as_deref().unwrap().contains("changed"));
+            assert!(goal.available_bytes.is_none());
+        }
+        assert!(goals[2].targets_met);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn byte_recovery_uses_available_blocks_and_fresh_per_root_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let missing = root.join("missing");
+        let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_hours(1));
+        *platform.inodes.lock() = None; // Byte recovery works without finite inode accounting.
+        platform.stats.lock().available_bytes = 50; // The other 450 free bytes are reserved.
+        let args = EmergencyArgs {
+            target_free: 10.0,
+            require_target: true,
+            ..EmergencyArgs::default()
+        };
+        let goals = |paths: &[PathBuf]| {
+            emergency_recovery_goals(
+                &capture_emergency_roots(paths),
+                &args,
+                &collector,
+                platform.as_ref(),
+            )
+        };
+        let quarantine = EmergencyQuarantineReport::default();
+        let mut report = empty_emergency_report();
+        let exit = |report: &DeletionReport, goals: &[EmergencyRecoveryGoal]| {
+            emergency_completion_result(report, &quarantine, goals)
+                .err()
+                .map_or(0, |error| error.exit_code())
+        };
+        let before = goals(std::slice::from_ref(&root));
+        assert_eq!(before[0].free_pct, Some(5.0));
+        assert_eq!(before[0].available_bytes, Some(50));
+        assert_eq!(before[0].available_inodes, None);
+        assert_eq!(exit(&report, &before), 1);
+        let mixed = goals(&[root.clone(), missing]);
+        assert!(mixed[1].issue.is_some());
+        assert_eq!(exit(&report, &mixed), 2);
+        report.items_deleted = 1;
+        assert_eq!(exit(&report, &before), 4);
+        assert_eq!(exit(&report, &mixed), 4);
+
+        platform.stats.lock().available_bytes = 100;
+        assert_eq!(exit(&report, &goals(std::slice::from_ref(&root))), 0);
+        assert_eq!(
+            emergency_pressure_skip(&collector, platform.as_ref(), &root, &args),
+            Some(SkipReason::TargetFreeReached)
+        );
+        platform.stats.lock().available_bytes = 501; // More available than free is invalid.
+        assert_eq!(
+            emergency_pressure_skip(&collector, platform.as_ref(), &root, &args),
+            Some(SkipReason::PressureUnavailable)
+        );
+        assert!(goals(std::slice::from_ref(&root))[0].issue.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn emergency_inode_goal_reclaims_zero_byte_artifacts_and_stops_on_fresh_evidence() {
         for evidence_lost in [false, true] {
             let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -23026,7 +23216,7 @@ mod tests {
             assert!(!first.exists());
             assert!(second.exists());
             let goals = emergency_recovery_goals(
-                std::slice::from_ref(&root),
+                &capture_emergency_roots(std::slice::from_ref(&root)),
                 &args,
                 &collector,
                 platform.as_ref(),
@@ -23200,7 +23390,7 @@ mod tests {
                 *platform.inodes.lock() = None;
             }
             let goals = emergency_recovery_goals(
-                std::slice::from_ref(&root),
+                &capture_emergency_roots(std::slice::from_ref(&root)),
                 &args,
                 &collector,
                 platform.as_ref(),

@@ -2406,6 +2406,20 @@ After a quarantine drain physically removes payloads and finalizes their recover
 
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted. Because no config is read, `--min-age <MINUTES>` (default 5) is the only age floor: artifacts modified more recently are left alone, and `--min-age 0` reclaims fresh builds too. Every candidate is printed with its decision id (`id <hex>` in the plan, `candidates[].decision_id` in `--json`), the same id `sbh scan` and `sbh clean` would record, so a later `sbh explain --id` can be matched against what emergency acted on.
 
+The final report measures available bytes on each requested path, including
+when the scan finds no candidates. A script can require verified headroom
+before restarting work.
+
+```bash
+sbh emergency /data --target-free 15 --require-target --yes
+```
+
+Success then requires verified recovery on every path. An unmet target exits
+1, unavailable evidence exits 2, and either condition after a completed removal
+exits 4. Without `--require-target`, byte-only cleanup keeps its usual exit
+behavior. Both modes report the measured outcome in `--json` under
+`recovery_goals`.
+
 If files cannot be created because the filesystem has exhausted its inodes,
 request an inode recovery target even when plenty of bytes remain:
 

@@ -338,6 +338,40 @@ fn clean_and_emergency_with_nothing_to_reclaim_are_exit_zero() {
     assert_eq!(payload["candidates_count"], 0);
 }
 
+/// A scan with no eligible artifacts can prove success, or report a pressure
+/// condition, from current capacity. The default remains best effort.
+#[test]
+fn emergency_byte_target_reports_capacity_and_can_require_it() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let root = dir.path().join("root");
+    let root = root.to_str().unwrap();
+    for (target, required, expected) in [("100", false, 0), ("100", true, 1), ("0", true, 0)] {
+        let mut args = vec![
+            "--json",
+            "emergency",
+            "--yes",
+            root,
+            "--target-free",
+            target,
+        ];
+        if required {
+            args.push("--require-target");
+        }
+        let output = sbh(&config, &args);
+        assert_eq!(output.status.code(), Some(expected), "{output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["exit_code"], expected);
+        assert_eq!(payload["items_deleted"], 0);
+        let goal = &payload["recovery_goals"][0];
+        assert_eq!(goal["required"], required);
+        assert_eq!(goal["targets_met"], target == "0");
+        assert!(goal["total_bytes"].as_u64().unwrap() > goal["available_bytes"].as_u64().unwrap());
+        assert!(goal["target_free_inodes_pct"].is_null());
+        assert!(goal["issue"].is_null());
+    }
+}
+
 #[cfg(unix)]
 fn emergency_fixture_command(directory: &Path, root: &Path, yes: bool) -> Output {
     let mut command = Command::new(common::sbh_bin_path());
