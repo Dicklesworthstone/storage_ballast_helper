@@ -123,6 +123,9 @@ pub struct PoolInventory {
     pub fs_type: String,
     pub strategy: ProvisionStrategy,
     pub files_available: usize,
+    /// Exact managed-slot counts from a live directory inspection. Cached
+    /// inventories cannot infer missing slots from a total that includes surplus.
+    pub managed_availability: Option<BallastAvailability>,
     pub files_total: usize,
     pub releasable_bytes: u64,
     /// Bytes the configuration asks for on this mount (`files_total` files).
@@ -1177,7 +1180,13 @@ impl BallastPoolCoordinator {
             planned,
             skipped: mut skipped_pools,
             aliases,
-        } = Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
+        } = Self::plan_pools(
+            config,
+            watched_paths,
+            platform,
+            configured_ballast_dir,
+            None,
+        )?;
         let mut pools = HashMap::new();
         for plan in planned {
             let refill_device = provision::mount_device(&plan.mount_point);
@@ -1253,9 +1262,40 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
         configured_ballast_dir: Option<&Path>,
     ) -> Result<Vec<PoolInventory>> {
+        let plan = Self::plan_pools(
+            config,
+            watched_paths,
+            platform,
+            configured_ballast_dir,
+            None,
+        )?;
+        Ok(Self::observe_plan(plan))
+    }
+
+    /// Observe the checked mount's local reserve without enumerating other
+    /// pools' files. Include the configured directory in mount selection so
+    /// a writable bind alias resolves to the same pool as its physical owner.
+    pub fn inventory_for_mount(
+        config: &BallastConfig,
+        mount: &Path,
+        platform: &dyn Platform,
+        configured_ballast_dir: &Path,
+    ) -> Result<Option<PoolInventory>> {
+        let paths = [mount.to_owned(), configured_ballast_dir.to_owned()];
+        let plan = Self::plan_pools(
+            config,
+            &paths,
+            platform,
+            Some(configured_ballast_dir),
+            Some(mount),
+        )?;
+        Ok(Self::observe_plan(plan).pop())
+    }
+
+    fn observe_plan(plan: PoolPlan) -> Vec<PoolInventory> {
         let PoolPlan {
             planned, skipped, ..
-        } = Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
+        } = plan;
         let mut inventory: Vec<PoolInventory> = planned
             .into_iter()
             .map(|plan| {
@@ -1286,6 +1326,7 @@ impl BallastPoolCoordinator {
                     unreachable_reserve: plan.unreachable_reserve,
                     skipped: false,
                     skip_reason: None,
+                    managed_availability: Some(observed),
                 }
             })
             .collect();
@@ -1306,10 +1347,11 @@ impl BallastPoolCoordinator {
                     unreachable_reserve: Vec::new(),
                     skipped: true,
                     skip_reason: Some(info.reason),
+                    managed_availability: None,
                 }),
         );
         inventory.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
-        Ok(inventory)
+        inventory
     }
 
     /// Decide which mounts get a pool (and why the others do not), observing
@@ -1319,6 +1361,7 @@ impl BallastPoolCoordinator {
         watched_paths: &[PathBuf],
         platform: &dyn Platform,
         configured_ballast_dir: Option<&Path>,
+        only_mount: Option<&Path>,
     ) -> Result<PoolPlan> {
         // Resolve an operator-selected directory alias at the configuration
         // boundary, before choosing its volume. The manager still opens the
@@ -1357,6 +1400,11 @@ impl BallastPoolCoordinator {
         );
         record_folded_mounts(&aliases, &mounts, &mut skipped_pools);
         let aliases = alias_other_entries_of_pooled_devices(aliases, &seen_mounts, &mounts);
+        if let Some(mount) = only_mount {
+            let keeper = aliases.get(mount).map_or(mount, PathBuf::as_path);
+            seen_mounts.retain(|path, _| path == keeper);
+            skipped_pools.retain(|path, _| path == keeper);
+        }
 
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
@@ -1418,6 +1466,14 @@ impl BallastPoolCoordinator {
 
             if strategy == ProvisionStrategy::Skip {
                 skip_with("filesystem strategy marked as skip".to_string());
+                continue;
+            }
+            if only_mount.is_some()
+                && resolved_dir.exists()
+                && pool_filesystem_access(&resolved_dir, mount_path, &aliases, platform, &mounts)
+                    != Some(true)
+            {
+                skip_with("pool directory is not writable on the checked filesystem".into());
                 continue;
             }
 
@@ -1823,6 +1879,7 @@ impl BallastPoolCoordinator {
                 fs_type: pool.fs_type.clone(),
                 strategy: pool.strategy,
                 files_available: pool.available_count(),
+                managed_availability: None,
                 files_total: pool.expected_count(),
                 releasable_bytes: pool.releasable_bytes(),
                 configured_bytes: pool
@@ -1863,6 +1920,7 @@ impl BallastPoolCoordinator {
                     unreachable_reserve: Vec::new(),
                     skipped: true,
                     skip_reason: Some(skipped.reason.clone()),
+                    managed_availability: None,
                 }),
         );
 

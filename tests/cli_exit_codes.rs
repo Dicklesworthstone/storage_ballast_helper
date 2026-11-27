@@ -140,6 +140,63 @@ fn check_positive_need_requires_a_writable_target_mount() {
     assert_eq!(check(&readonly, "0").status.code(), Some(0));
 }
 
+#[test]
+fn check_reports_only_the_reserve_on_the_checked_filesystem() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let primary = dir.path().join("data/ballast");
+    let secondary = dir.path().join("root");
+    let pool = secondary.join(".sbh/ballast");
+    fs::create_dir_all(&primary).unwrap();
+    fs::write(primary.join("SBH_BALLAST_FILE_00001.dat"), [1; 4096]).unwrap();
+    let base = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!(
+        "{base}\n[ballast]\nfile_count = 1\nfile_size_bytes = 4096\n[ballast.overrides.{:?}]\nfile_count = 2\n",
+        secondary.to_str().unwrap()
+    )).unwrap();
+    let check = |path: &Path, secondary_device| {
+        let mounts = serde_json::json!({"mounts": [
+            { "path": dir.path(), "device": "/dev/sbh-a", "total": 100_000, "free": 90_000 },
+            { "path": secondary, "device": secondary_device, "total": 100_000, "free": 90_000 },
+        ]});
+        let output = Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config)
+            .args(["--json", "check", "--target-free", "0"])
+            .arg(path)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", mounts.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["ballast"].clone()
+    };
+    let other = check(&secondary, "/dev/sbh-b");
+    assert_eq!(other["ballast_dir"], pool.to_str().unwrap());
+    assert_eq!(other["configured_pool_bytes"], 8192);
+    assert_eq!(other["releasable_bytes"], 0);
+    assert_eq!(other["missing_count"], 2);
+    assert_eq!(other["health"], "empty");
+    assert!(!pool.exists(), "preflight must leave a missing pool absent");
+
+    fs::create_dir_all(&pool).unwrap();
+    fs::write(pool.join("SBH_BALLAST_FILE_00001.dat"), [2; 4096]).unwrap();
+    let partial = check(&secondary, "/dev/sbh-b");
+    assert_eq!(partial["releasable_bytes"], 4096);
+    assert_eq!(partial["missing_count"], 1);
+    assert_eq!(partial["health"], "degraded");
+    let local = check(dir.path(), "/dev/sbh-b");
+    assert_eq!(local["ballast_dir"], primary.to_str().unwrap());
+    assert_eq!(local["configured_pool_bytes"], 4096);
+    assert_eq!(local["health"], "ok");
+
+    let alias = check(&secondary, "/dev/sbh-a");
+    assert_eq!(alias["mount_point"], secondary.to_str().unwrap());
+    assert_eq!(alias["pool_mount_point"], dir.path().to_str().unwrap());
+    assert_eq!(alias["ballast_dir"], primary.to_str().unwrap());
+}
+
 /// Plenty of apparent tmpfs blocks must not hide insufficient host/process RAM.
 /// Only mount capacity is injected; the binary reads native memory evidence.
 #[cfg(target_os = "linux")]

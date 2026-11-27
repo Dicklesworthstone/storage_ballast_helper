@@ -17180,27 +17180,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 2.6 (#16): warn when a configured ballast reserve is not actually
     // releasable — the emergency reserve does not exist when it may be needed.
-    let ballast = BallastAvailability::observe(
-        &resolve_configured_pool_alias(&config.paths.ballast_dir),
-        &config.ballast,
-    );
-    if output_mode(cli) == OutputMode::Human {
-        if ballast.health == BallastHealth::Empty {
-            eprintln!(
-                "sbh: warning: ballast reserve is empty ({} configured, 0 releasable). Run: sbh ballast provision",
-                format_bytes(ballast.configured_pool_bytes),
-            );
-        } else if !ballast.is_authoritative() {
-            // Don't go silent here. Before the readability fix this path emitted
-            // a bogus "reserve is empty"; the fix must replace that with an
-            // honest "couldn't tell", not with nothing at all.
-            eprintln!(
-                "sbh: note: could not inspect {} of {} ballast files (permission denied or \
-                 I/O error); reserve state unknown. Re-run as `sudo sbh ballast status`.",
-                ballast.unreadable_count, ballast.configured_count,
-            );
-        }
-    }
+    let ballast = check_mount_ballast(cli, &config, platform.as_ref(), &capacity.mount_point);
 
     // Check 3: the daemon's forecast (`--predict N`): the mount's
     // `seconds_to_red` from state.json v2, or the rate against the check's
@@ -17357,25 +17337,73 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "unprotected": unprotected_json,
             // #16: machine-readable reserve state so automation can flag a
             // configured-but-empty emergency reserve.
-            "ballast": {
-                "configured_pool_bytes": ballast.configured_pool_bytes,
-                "releasable_bytes": ballast.releasable_bytes,
-                "available_count": ballast.available_count,
-                "missing_count": ballast.missing_count,
-                // Non-zero means this snapshot is NOT authoritative (usually an
-                // unprivileged caller against a root-owned, mode-700 dir).
-                // Automation must not treat `missing_count` as a real absence
-                // while this is > 0.
-                "unreadable_count": ballast.unreadable_count,
-                "authoritative": ballast.is_authoritative(),
-                "health": ballast.health.as_str(),
-            },
+            "ballast": ballast,
             "exit_code": 0,
         });
         write_json_line(&payload)?;
     }
 
     Ok(())
+}
+
+/// Inspect the reserve that could free blocks on the checked filesystem.
+fn check_mount_ballast(cli: &Cli, config: &Config, platform: &dyn Platform, mount: &Path) -> Value {
+    use storage_ballast_helper::ballast::coordinator::BallastPoolCoordinator;
+
+    let observation = BallastPoolCoordinator::inventory_for_mount(
+        &config.ballast,
+        mount,
+        platform,
+        &config.paths.ballast_dir,
+    );
+    let reason = match observation {
+        Ok(Some(pool)) => {
+            if let Some(managed) = pool.managed_availability {
+                if output_mode(cli) == OutputMode::Human {
+                    if pool.health == BallastHealth::Empty {
+                        eprintln!(
+                            "sbh: warning: ballast reserve is empty on {} ({} configured, 0 releasable). Inspect: sbh ballast status",
+                            mount.display(),
+                            format_bytes(pool.configured_bytes),
+                        );
+                    } else if !managed.is_authoritative() {
+                        eprintln!(
+                            "sbh: note: could not inspect all ballast files on {}; reserve state unknown. Inspect: sudo sbh ballast status",
+                            mount.display(),
+                        );
+                    }
+                }
+                return json!({
+                    "mount_point": mount.to_string_lossy(),
+                    "pool_mount_point": pool.mount_point.to_string_lossy(),
+                    "ballast_dir": pool.ballast_dir.to_string_lossy(),
+                    "configured_pool_bytes": pool.configured_bytes,
+                    "releasable_bytes": pool.releasable_bytes,
+                    "available_count": pool.files_available,
+                    "missing_count": managed.missing_count,
+                    "unreadable_count": managed.unreadable_count,
+                    "authoritative": managed.is_authoritative(),
+                    "health": pool.health.as_str(),
+                });
+            }
+            pool.skip_reason
+                .unwrap_or_else(|| "no local reserve observation".into())
+        }
+        Ok(None) => "no matching pool mount".into(),
+        Err(error) => error.to_string(),
+    };
+    if output_mode(cli) == OutputMode::Human {
+        eprintln!(
+            "sbh: note: no ballast inventory for {} ({reason})",
+            mount.display()
+        );
+    }
+    json!({
+        "mount_point": mount.to_string_lossy(),
+        "configured_pool_bytes": null, "releasable_bytes": null, "available_count": null,
+        "missing_count": null, "unreadable_count": null, "authoritative": false,
+        "health": BallastHealth::Indeterminate.as_str(), "reason": reason,
+    })
 }
 
 /// Reason slug `check` exits 1 with when the target mount is pressured and
