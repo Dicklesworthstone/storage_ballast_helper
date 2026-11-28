@@ -3072,6 +3072,13 @@ impl PredictiveWarningKey {
             Self::Device,
         )
     }
+
+    fn device_id(&self) -> Option<u64> {
+        match self {
+            Self::Device(id) => Some(*id),
+            Self::Path(_) => None,
+        }
+    }
 }
 
 /// A finite, positive prediction or nothing.
@@ -9813,7 +9820,7 @@ impl MonitoringDaemon {
             observations,
             now,
             |event| self.logger_handle.send(event),
-            |event| self.notification_manager.notify_with_outcome(event),
+            |event, device| self.notification_manager.notify_on_device(event, device),
         );
     }
 
@@ -12451,9 +12458,10 @@ impl MonitoringDaemon {
         for tick in responses {
             let key = PredictiveWarningKey::of(tick);
             if !per_filesystem.iter().any(|entry| entry.0 == key) {
-                self.notification_manager.forget_pending(
+                self.notification_manager.forget_pending_on_device(
                     "predictive_warning",
                     &tick.response.causing_mount.to_string_lossy(),
+                    tick.device_id,
                 );
             }
         }
@@ -12465,7 +12473,7 @@ impl MonitoringDaemon {
             {
                 continue;
             }
-            if self.notification_manager.notify_with_outcome(&event)
+            if self.notification_manager.notify_on_device(&event, key.device_id())
                 == NotificationDispatchOutcome::Accepted
             {
                 self.last_predictive_warning.insert(key, (level, now));
@@ -27484,8 +27492,8 @@ mod tests {
         daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
             enabled: true,
             channels: vec!["file".into()],
-            min_notify_interval_secs: 0,
-            urgent_notify_interval_secs: 0,
+            min_notify_interval_secs: 300,
+            urgent_notify_interval_secs: 300,
             file: FileConfig {
                 path: notifications.clone(),
             },
@@ -27521,6 +27529,8 @@ mod tests {
             critical: true,
         };
         daemon.check_predictive_warnings(&escalated, now + Duration::from_secs(10));
+        // Another physical volume takes over a still-throttled mount path.
+        daemon.check_predictive_warnings(&[tick("/other", Some(22))], now + Duration::from_secs(11));
         assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
 
         let warnings: Vec<(String, String)> = std::fs::read_to_string(&notifications)
@@ -27541,6 +27551,7 @@ mod tests {
             ("/unknown-a", "orange"),
             ("/unknown-b", "orange"),
             ("/root", "critical"),
+            ("/other", "orange"),
         ]
         .map(|(mount, level)| (mount.to_owned(), level.to_owned()));
         assert_eq!(warnings, expected, "{warnings:?}");

@@ -320,6 +320,10 @@ impl NotificationEvent {
         }
     }
 
+    fn delivery_scope(&self, device: Option<u64>) -> NotificationScope {
+        (self.type_key(), NotificationSubject::on_device(device, self.throttle_scope()))
+    }
+
     /// Short human-readable summary line.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -1129,7 +1133,25 @@ impl ChannelWorker {
     }
 }
 
-type NotificationScope = (&'static str, String);
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum NotificationSubject {
+    Device(u64),
+    Named(String),
+}
+
+impl From<&str> for NotificationSubject {
+    fn from(name: &str) -> Self {
+        Self::Named(name.to_owned())
+    }
+}
+
+impl NotificationSubject {
+    fn on_device(device: Option<u64>, fallback: &str) -> Self {
+        device.map_or_else(|| fallback.into(), Self::Device)
+    }
+}
+
+type NotificationScope = (&'static str, NotificationSubject);
 type ChannelCooldowns = HashMap<&'static str, BTreeMap<NotificationLevel, Instant>>;
 
 /// A currently retried condition, independent of its changing measurements.
@@ -1300,7 +1322,7 @@ impl NotificationManager {
     pub fn notify(&mut self, event: &NotificationEvent) {
         // Independent one-shot events do not inherit a partial state-alert
         // cursor. Reserve observations always retain their transition cursor.
-        self.dispatch_at(event, Instant::now(), false, event.type_key());
+        self.dispatch_at(event, Instant::now(), false, event.delivery_scope(None));
     }
 
     /// Report acceptance by every eligible queue. Callers can retry an ongoing
@@ -1313,6 +1335,16 @@ impl NotificationManager {
         event: &NotificationEvent,
     ) -> NotificationDispatchOutcome {
         self.notify_at(event, Instant::now())
+    }
+
+    /// Keep the display mount on the event while tracking delivery for its
+    /// physical device. Aliases share receipts, replacement volumes do not.
+    pub(super) fn notify_on_device(
+        &mut self,
+        event: &NotificationEvent,
+        device: Option<u64>,
+    ) -> NotificationDispatchOutcome {
+        self.dispatch_at(event, Instant::now(), true, event.delivery_scope(device))
     }
 
     /// Preserve the established pressure event on the wire. The horizon
@@ -1331,14 +1363,24 @@ impl NotificationManager {
             mount: path.to_string_lossy().into_owned(),
             free_pct,
         };
-        self.dispatch_at(&event, Instant::now(), true, SPECIAL_LOCATION_ALERT_SCOPE)
+        let key = (SPECIAL_LOCATION_ALERT_SCOPE, event.throttle_scope().into());
+        self.dispatch_at(&event, Instant::now(), true, key)
     }
 
     /// End a caller's condition without erasing destination cooldowns. A new
     /// episode must not inherit partial acknowledgments from the old one.
     pub(crate) fn forget_pending(&mut self, category: &'static str, scope: &str) {
+        self.forget_pending_on_device(category, scope, None);
+    }
+
+    pub(super) fn forget_pending_on_device(
+        &mut self,
+        category: &'static str,
+        scope: &str,
+        device: Option<u64>,
+    ) {
         self.pending_notifications
-            .remove(&(category, scope.to_owned()));
+            .remove(&(category, NotificationSubject::on_device(device, scope)));
     }
 
     #[cfg(all(test, unix))]
@@ -1379,7 +1421,7 @@ impl NotificationManager {
         event: &NotificationEvent,
         now: Instant,
     ) -> NotificationDispatchOutcome {
-        self.dispatch_at(event, now, true, event.type_key())
+        self.dispatch_at(event, now, true, event.delivery_scope(None))
     }
 
     fn dispatch_at(
@@ -1387,7 +1429,7 @@ impl NotificationManager {
         event: &NotificationEvent,
         now: Instant,
         retain_partial: bool,
-        category: &'static str,
+        key: NotificationScope,
     ) -> NotificationDispatchOutcome {
         if !self.enabled {
             return NotificationDispatchOutcome::Unavailable;
@@ -1401,7 +1443,6 @@ impl NotificationManager {
             });
             !channels.is_empty()
         });
-        let key = (category, event.throttle_scope().to_owned());
         let retry_retention =
             retention.max(Duration::from_secs(DEFAULT_URGENT_NOTIFY_INTERVAL_SECS));
         self.pending_notifications.retain(|_, pending| {
@@ -2855,6 +2896,39 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_aliases_share_partial_receipts_and_replacement_devices_alert_immediately() {
+        for interval in [0, 300] {
+            let mut config = partial_notification_config();
+            config.urgent_notify_interval_secs = interval;
+            let (mut manager, queues) = queued_notification_manager(&config);
+            occupy_notification_queue(&manager, 1);
+            let original = pressure_event("/scratch", NotificationLevel::Critical);
+            let alias = pressure_event("/scratch-bind", NotificationLevel::Critical);
+            assert_eq!(
+                manager.notify_on_device(&original, Some(7)),
+                NotificationDispatchOutcome::Unavailable
+            );
+            assert_eq!(take_notification(&queues[0]).summary(), original.summary());
+            assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+            assert_eq!(
+                manager.notify_on_device(&alias, Some(7)),
+                NotificationDispatchOutcome::Accepted
+            );
+            assert!(queues[0].is_empty(), "alias must retain the file receipt");
+            assert_eq!(take_notification(&queues[1]).summary(), alias.summary());
+
+            assert_eq!(
+                manager.notify_on_device(&original, Some(22)),
+                NotificationDispatchOutcome::Accepted,
+                "another volume mounted at /scratch needs both alerts"
+            );
+            for queue in &queues {
+                assert_eq!(take_notification(queue).summary(), original.summary());
+            }
+        }
+    }
+
+    #[test]
     fn partial_enqueue_retries_only_missing_destinations_even_without_cooldowns() {
         let config = partial_notification_config();
         let (mut manager, queues) = queued_notification_manager(&config);
@@ -3007,7 +3081,7 @@ mod tests {
         let now = Instant::now();
         let exhausted = reserve_event("/data", 0, true);
         assert_eq!(
-            manager.dispatch_at(&exhausted, now, false, exhausted.type_key()),
+            manager.dispatch_at(&exhausted, now, false, exhausted.delivery_scope(None)),
             NotificationDispatchOutcome::Unavailable
         );
         assert_eq!(
@@ -3221,7 +3295,7 @@ mod tests {
                     &event,
                     now + Duration::from_secs(2001),
                     false,
-                    event.type_key()
+                    event.delivery_scope(None)
                 ),
                 NotificationDispatchOutcome::Unavailable
             );

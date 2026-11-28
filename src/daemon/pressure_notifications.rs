@@ -41,6 +41,15 @@ enum PressureKey {
     HostSwap,
 }
 
+impl PressureKey {
+    fn device_id(&self) -> Option<u64> {
+        match self {
+            Self::Bytes(FilesystemKey::Device(id)) | Self::Inodes(FilesystemKey::Device(id)) => Some(*id),
+            Self::Bytes(FilesystemKey::Path(_)) | Self::Inodes(FilesystemKey::Path(_)) | Self::HostSwap => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum PressureEvidence {
     Bytes {
@@ -255,7 +264,7 @@ impl PressureNotifications {
         observations: &[PressureObservation],
         now: Instant,
         mut log: impl FnMut(ActivityEvent),
-        mut notify: impl FnMut(&NotificationEvent) -> NotificationDispatchOutcome,
+        mut notify: impl FnMut(&NotificationEvent, Option<u64>) -> NotificationDispatchOutcome,
     ) {
         let mut grouped: Vec<(PressureKey, &PressureObservation)> = Vec::new();
         for observation in observations {
@@ -313,7 +322,8 @@ impl PressureNotifications {
                 .then_some(from);
             }
             if let Some(from) = state.pending_from
-                && notify(&observation.notification(from)) == NotificationDispatchOutcome::Accepted
+                && notify(&observation.notification(from), observation.key.device_id())
+                    == NotificationDispatchOutcome::Accepted
             {
                 state.notified = Some((level, now));
                 state.pending_from = None;
@@ -428,7 +438,7 @@ mod tests {
             &observations,
             now,
             |event| logs.push(event),
-            |event| {
+            |event, _| {
                 notices.push(event.clone());
                 NotificationDispatchOutcome::Accepted
             },
@@ -440,7 +450,7 @@ mod tests {
             &[],
             now + Duration::from_secs(1),
             |event| logs.push(event),
-            |event| {
+            |event, _| {
                 notices.push(event.clone());
                 NotificationDispatchOutcome::Accepted
             },
@@ -455,7 +465,7 @@ mod tests {
                 &observations,
                 now + Duration::from_secs(seconds),
                 |event| logs.push(event),
-                |event| {
+                |event, _| {
                     notices.push(event.clone());
                     outcome
                 },
@@ -485,7 +495,7 @@ mod tests {
             &[recovered.observation()],
             now + Duration::from_secs(5),
             |event| logs.push(event),
-            |event| {
+            |event, _| {
                 notices.push(event.clone());
                 NotificationDispatchOutcome::Accepted
             },
@@ -520,7 +530,8 @@ mod tests {
                 &observations,
                 at,
                 |event| logs.push(event),
-                |event| {
+                |event, device| {
+                    assert_eq!(device, Some(7));
                     notices.push(event.clone());
                     if tick == 0 && matches!(event, NotificationEvent::InodePressureChanged { .. }) {
                         NotificationDispatchOutcome::Unavailable
@@ -583,7 +594,8 @@ mod tests {
                 &[exhausted.clone(), exhausted.clone()],
                 now + Duration::from_secs(tick as u64),
                 |event| logs.push(event),
-                |event| {
+                |event, device| {
+                    assert_eq!(device, None);
                     notices.push(event.clone());
                     outcome
                 },
@@ -606,7 +618,7 @@ mod tests {
             &absent,
             now + Duration::from_secs(3),
             |_| panic!("missing swap counters cannot prove recovery"),
-            |_| panic!("missing evidence cannot deliver a recovery"),
+            |_, _| panic!("missing evidence cannot deliver a recovery"),
         );
 
         let recovered_at = now + Duration::from_secs(4);
@@ -616,7 +628,7 @@ mod tests {
             &[recovered],
             recovered_at,
             |event| logs.push(event),
-            |_| panic!("recovery respects the delivered urgent cooldown"),
+            |_, _| panic!("recovery respects the delivered urgent cooldown"),
         );
         assert_eq!(
             logs.len(),
@@ -640,7 +652,7 @@ mod tests {
                 &[sample.observation()],
                 at,
                 |event| logs.push(event),
-                |event| {
+                |event, _| {
                     notices.push(event.clone());
                     NotificationDispatchOutcome::Accepted
                 },
@@ -674,7 +686,7 @@ mod tests {
                 &samples,
                 now,
                 |event| logs.push(event),
-                |event| {
+                |event, _| {
                     notices.push(event.clone());
                     NotificationDispatchOutcome::Accepted
                 },
@@ -686,7 +698,7 @@ mod tests {
             &[root.observation(), peer.observation()],
             later,
             |event| logs.push(event),
-            |event| {
+            |event, _| {
                 notices.push(event.clone());
                 NotificationDispatchOutcome::Accepted
             },
@@ -731,7 +743,7 @@ mod tests {
                 &observations,
                 later,
                 |event| logs.push(event),
-                |event| {
+                |event, _| {
                     notices.push(event.clone());
                     NotificationDispatchOutcome::Accepted
                 },
@@ -744,7 +756,7 @@ mod tests {
             &[recovered.observation()],
             recovered.collected_at,
             |event| logs.push(event),
-            |event| {
+            |event, _| {
                 notices.push(event.clone());
                 NotificationDispatchOutcome::Accepted
             },
@@ -771,7 +783,7 @@ mod tests {
                         &[prior.observation()],
                         now,
                         |event| logs.push(event),
-                        |event| {
+                        |event, _| {
                             notices.push(event.clone());
                             NotificationDispatchOutcome::Accepted
                         },
@@ -790,7 +802,7 @@ mod tests {
                         &observations,
                         tick,
                         |event| logs.push(event),
-                        |event| {
+                        |event, _| {
                             notices.push(event.clone());
                             NotificationDispatchOutcome::Accepted
                         },
@@ -817,7 +829,7 @@ mod tests {
                     &tied,
                     tied_at,
                     |event| logs.push(event),
-                    |event| {
+                    |event, _| {
                         notices.push(event.clone());
                         NotificationDispatchOutcome::Accepted
                     },
@@ -851,7 +863,7 @@ mod tests {
                 &[urgent.observation()],
                 now + Duration::from_secs(tick as u64),
                 |event| logs.push(event),
-                |event| {
+                |event, _| {
                     attempts.push(event.clone());
                     outcome
                 },
@@ -884,7 +896,7 @@ mod tests {
                 &[sample.observation()],
                 sample.collected_at,
                 |_| {},
-                |event| {
+                |event, _| {
                     attempts.push(event.clone());
                     NotificationDispatchOutcome::Unavailable
                 },
@@ -909,7 +921,7 @@ mod tests {
                 &[sample.observation()],
                 at,
                 |_| {},
-                |_| {
+                |_, _| {
                     count += 1;
                     NotificationDispatchOutcome::Accepted
                 },
@@ -929,7 +941,8 @@ mod tests {
             &[first.observation(), second.observation()],
             now,
             |_| {},
-            |_| {
+            |_, device| {
+                assert_eq!(device, None);
                 count += 1;
                 NotificationDispatchOutcome::Accepted
             },
@@ -939,7 +952,7 @@ mod tests {
             &[],
             now + NOTIFY_COOLDOWN,
             |_| panic!("invented recovery"),
-            |_| panic!("delivered absent evidence"),
+            |_, _| panic!("delivered absent evidence"),
         );
         assert!(tracker.filesystems.is_empty());
     }
