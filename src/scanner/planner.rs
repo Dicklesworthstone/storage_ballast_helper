@@ -85,12 +85,31 @@ pub(super) fn hard_veto(candidate: &CandidacyScore) -> bool {
     candidate.vetoed || candidate.veto_reason.is_some() || candidate.decision.category_suspended
 }
 
-fn has_path_aliases<'a>(candidates: impl IntoIterator<Item = &'a CandidacyScore>) -> bool {
+/// A path's contribution to cleanup safety, independent of its eligibility
+/// as a candidate. Index replay and live walks use the same scope closure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SafetyObservation<'a> {
+    pub path: &'a Path,
+    pub identity: Option<FsIdentity>,
+    pub vetoed: bool,
+}
+
+impl<'a> From<&'a CandidacyScore> for SafetyObservation<'a> {
+    fn from(score: &'a CandidacyScore) -> Self {
+        Self {
+            path: &score.path,
+            identity: score.identity,
+            vetoed: hard_veto(score),
+        }
+    }
+}
+
+fn has_path_aliases<'a>(candidates: impl IntoIterator<Item = SafetyObservation<'a>>) -> bool {
     let mut identities: HashMap<FsIdentity, &Path> = HashMap::new();
     for candidate in candidates {
         if let Some(identity) = candidate.identity
-            && let Some(previous) = identities.insert(identity, candidate.path.as_path())
-            && previous != candidate.path.as_path()
+            && let Some(previous) = identities.insert(identity, candidate.path)
+            && previous != candidate.path
         {
             return true;
         }
@@ -104,8 +123,14 @@ fn has_path_aliases<'a>(candidates: impl IntoIterator<Item = &'a CandidacyScore>
 pub fn rejected_observations<'a>(
     candidates: impl IntoIterator<Item = &'a CandidacyScore, IntoIter: Clone>,
 ) -> Vec<bool> {
+    rejected_scopes(candidates.into_iter().map(SafetyObservation::from))
+}
+
+pub(crate) fn rejected_scopes<'a>(
+    candidates: impl IntoIterator<Item = SafetyObservation<'a>, IntoIter: Clone>,
+) -> Vec<bool> {
     let candidates = candidates.into_iter();
-    if !candidates.clone().any(hard_veto) {
+    if !candidates.clone().any(|candidate| candidate.vetoed) {
         return vec![false; candidates.count()];
     }
     // Most walks observe each physical entry at one path. Do not materialize
@@ -116,15 +141,15 @@ pub fn rejected_observations<'a>(
     }
     let scopes: BTreeSet<_> = candidates
         .clone()
-        .filter(|candidate| hard_veto(candidate))
-        .map(|candidate| candidate.path.clone())
+        .filter(|candidate| candidate.vetoed)
+        .map(|candidate| candidate.path)
         .collect();
     candidates
         .map(|candidate| {
-            let path = candidate.path.as_path();
+            let path = candidate.path;
             path.ancestors().any(|ancestor| scopes.contains(ancestor))
                 || scopes
-                    .range(candidate.path.clone()..)
+                    .range(path..)
                     .next()
                     .is_some_and(|scope| scope.starts_with(path))
         })
@@ -203,7 +228,7 @@ fn mark_reachable(marked: &mut [bool], edges: &[Vec<usize>]) {
 }
 
 fn rejected_with_aliases<'a>(
-    candidates: impl IntoIterator<Item = &'a CandidacyScore, IntoIter: Clone>,
+    candidates: impl IntoIterator<Item = SafetyObservation<'a>, IntoIter: Clone>,
 ) -> Vec<bool> {
     // The finite prefix trie is bounded by the input's total path components,
     // not by the filesystem's size or the number of spellings an alias cycle
@@ -213,7 +238,7 @@ fn rejected_with_aliases<'a>(
     let mut observations = Vec::with_capacity(candidates.size_hint().0);
     for candidate in candidates.clone() {
         let next = paths.len();
-        observations.push(*paths.entry(candidate.path.as_path()).or_insert(next));
+        observations.push(*paths.entry(candidate.path).or_insert(next));
         for ancestor in candidate.path.ancestors().skip(1) {
             let next = paths.len();
             paths.entry(ancestor).or_insert(next);
@@ -247,7 +272,7 @@ fn rejected_with_aliases<'a>(
     }
     let mut rejected = vec![false; paths.len()];
     for (candidate, &index) in candidates.zip(&observations) {
-        if hard_veto(candidate) {
+        if candidate.vetoed {
             rejected[roots[index]] = true;
         }
     }
@@ -751,9 +776,13 @@ mod tests {
             candidate("/unknown", 5, None),
             candidate("/other-unknown", 6, None),
         ];
-        assert!(!has_path_aliases(&candidates));
+        assert!(!has_path_aliases(
+            candidates.iter().map(SafetyObservation::from)
+        ));
         candidates.push(candidate("/b", 7, Some((7, 2))));
-        assert!(has_path_aliases(&candidates));
+        assert!(has_path_aliases(
+            candidates.iter().map(SafetyObservation::from)
+        ));
     }
 
     #[test]
@@ -769,7 +798,9 @@ mod tests {
             candidates.push(candidate(&format!("{path}/child"), 1, None));
             candidates.push(candidate(&format!("/cache/group-{index}/safe"), 1, None));
         }
-        assert!(!has_path_aliases(&candidates));
+        assert!(!has_path_aliases(
+            candidates.iter().map(SafetyObservation::from)
+        ));
         let actual = rejected_observations(&candidates);
         assert_eq!(actual, expected);
         assert_eq!(actual.iter().filter(|&&rejected| rejected).count(), 10);
@@ -800,7 +831,9 @@ mod tests {
                 candidate("/b/busy/deep", 1000, None),
                 candidate("/b/safe", 5, None),
             ];
-            assert!(has_path_aliases(&candidates));
+            assert!(has_path_aliases(
+                candidates.iter().map(SafetyObservation::from)
+            ));
             let mut req = request(Some(6));
             req.level = level;
             req.include_review = false;
@@ -1000,8 +1033,11 @@ mod tests {
             req.risk_budget = Some(1.5);
             let reference = reference_rejections(&candidates);
             assert_eq!(rejected_observations(&candidates), reference);
-            if !has_path_aliases(&candidates) {
-                assert_eq!(rejected_with_aliases(&candidates), reference);
+            if !has_path_aliases(candidates.iter().map(SafetyObservation::from)) {
+                assert_eq!(
+                    rejected_with_aliases(candidates.iter().map(SafetyObservation::from)),
+                    reference
+                );
             }
             let old = direct_reference_rejections(&candidates);
             for (old, &current) in old.iter().zip(&reference) {

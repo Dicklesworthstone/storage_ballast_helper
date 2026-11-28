@@ -21,6 +21,7 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, OpaqueTreeClassification, OpaqueTreeDisposition,
     StructuralSignals,
 };
+use crate::scanner::planner::{SafetyObservation, hard_veto, rejected_scopes};
 use crate::scanner::scoring::{
     CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
 };
@@ -120,6 +121,12 @@ pub enum CandidateSafetyState {
     Failed,
 }
 
+impl CandidateSafetyState {
+    fn is_veto(self) -> bool {
+        matches!(self, Self::Vetoed | Self::ActiveReference)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateFreshness {
     Fresh,
@@ -177,6 +184,26 @@ pub struct CandidateIndexRecord {
 }
 
 impl CandidateIndexRecord {
+    fn safety_observation(&self) -> SafetyObservation<'_> {
+        SafetyObservation {
+            path: &self.path,
+            identity: Some(self.identity.into()),
+            vetoed: self.safety_state.is_veto(),
+        }
+    }
+
+    /// Missing and positively rebound paths retire old evidence. An
+    /// unreadable directory cannot establish that its veto disappeared.
+    fn may_still_name_object(&self) -> bool {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => identity_from_metadata(&metadata) == self.identity,
+            Err(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ),
+        }
+    }
+
     pub fn from_candidate_score(
         score: &CandidacyScore,
         opaque_tree: Option<&OpaqueTreeClassification>,
@@ -327,7 +354,7 @@ impl CandidateIndexRecord {
 }
 
 fn safety_state_from_score(score: &CandidacyScore) -> CandidateSafetyState {
-    if !score.vetoed {
+    if !hard_veto(score) {
         return CandidateSafetyState::Safe;
     }
     if score.veto_reason.as_ref().is_some_and(|reason| {
@@ -435,12 +462,7 @@ impl ScannerCandidateIndex {
     /// with fresh vetoes before dispatch (`replay_indexed_record`).
     #[must_use]
     pub fn ranked_records(&self, now: SystemTime, limit: usize) -> Vec<CandidateIndexRecord> {
-        replay::ranked_records(
-            self.records.values(),
-            self.event_generation,
-            system_time_nanos(now),
-            limit,
-        )
+        self.ranked_matching(now, limit, |_| true)
     }
 
     /// [`Self::ranked_records`] restricted to records under one of `roots`.
@@ -453,10 +475,41 @@ impl ScannerCandidateIndex {
         now: SystemTime,
         limit: usize,
     ) -> Vec<CandidateIndexRecord> {
+        self.ranked_matching(now, limit, |path| {
+            roots.iter().any(|root| path.starts_with(root))
+        })
+    }
+
+    pub(crate) fn safety_observations(
+        &self,
+    ) -> impl Iterator<Item = SafetyObservation<'_>> + Clone {
+        self.records
+            .values()
+            .map(CandidateIndexRecord::safety_observation)
+    }
+
+    fn ranked_matching(
+        &self,
+        now: SystemTime,
+        limit: usize,
+        within_scope: impl Fn(&Path) -> bool,
+    ) -> Vec<CandidateIndexRecord> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Apply the full graph before scope, score, cooldown or heap limits.
+        // With no vetoes ranking still needs only the bounded heap.
+        let evidence = self.safety_observations();
+        let denied = evidence
+            .clone()
+            .any(|row| row.vetoed)
+            .then(|| rejected_scopes(evidence));
+        let eligible_scope = self.records.values().enumerate().filter_map(|(i, record)| {
+            (denied.as_ref().is_none_or(|flags| !flags[i]) && within_scope(&record.path))
+                .then_some(record)
+        });
         replay::ranked_records(
-            self.records
-                .values()
-                .filter(|record| roots.iter().any(|root| record.path.starts_with(root))),
+            eligible_scope,
             self.event_generation,
             system_time_nanos(now),
             limit,
@@ -485,6 +538,7 @@ impl ScannerCandidateIndex {
         let before = self.records.len();
         self.records.retain(|_, record| {
             record.event_generation == generation
+                || (record.safety_state.is_veto() && record.may_still_name_object())
                 || record
                     .cooldown_until_nanos
                     .is_some_and(|until| now_nanos < until)
@@ -763,6 +817,19 @@ mod tests {
                 summary: "test".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn category_suspension_and_reason_only_veto_survive_indexing() {
+        let mut held = score("/held".into(), identity(1).into());
+        held.decision.category_suspended = true;
+        assert_eq!(safety_state_from_score(&held), CandidateSafetyState::Vetoed);
+        held.decision.category_suspended = false;
+        held.veto_reason = Some("active reference".into());
+        assert_eq!(
+            safety_state_from_score(&held),
+            CandidateSafetyState::ActiveReference
+        );
     }
 
     #[test]

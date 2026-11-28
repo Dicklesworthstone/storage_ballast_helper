@@ -53,12 +53,19 @@ impl ScannerCandidateIndex {
 }
 
 fn revoke(record: &mut CandidateIndexRecord) -> bool {
-    let changed = record.score.is_some() || record.safety_state != CandidateSafetyState::Unknown;
+    let revoked_state = if record.safety_state.is_veto() {
+        record.safety_state
+    } else {
+        CandidateSafetyState::Unknown
+    };
+    let changed = record.score.is_some() || record.safety_state != revoked_state;
     // Revoke the positive score as well as the safety state. A retained
     // record is historical evidence until a new walk scores it, even when
     // delayed executor feedback updates its failure backoff.
     record.score = None;
-    record.safety_state = CandidateSafetyState::Unknown;
+    // An event withdraws permission; it cannot certify that a previously
+    // protected child is now safe underneath a separately refreshed parent.
+    record.safety_state = revoked_state;
     // Keep identity, observed metadata, structural evidence, and backoff as
     // historical hints. A new walk must score the candidate again; unchanged
     // evidence must not erase its accumulated failed-deletion cooldown.
@@ -185,6 +192,36 @@ mod tests {
             root_fingerprint: "replay-root".to_string(),
             config_fingerprint: "replay-config".to_string(),
         })
+    }
+
+    #[test]
+    fn replay_applies_vetoes_outside_requested_roots_before_the_rank_limit() {
+        let mut index = index();
+        let mut held = record(1);
+        held.path = "/watched".into();
+        held.safety_state = CandidateSafetyState::ActiveReference;
+        held.score = None;
+        let mut blocked = record(2);
+        blocked.path = "/watched/target".into();
+        blocked.score = Some(1.0);
+        let clear = record(3);
+        let roots = [blocked.path.clone(), clear.path.clone()];
+        index.upsert(held.clone());
+        index.upsert(blocked.clone());
+        index.upsert(clear.clone());
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1),
+            vec![clear.clone()]
+        );
+        index.invalidate_paths([held.path.as_path()]);
+        index.upsert(blocked.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![clear]);
+        held.safety_state = CandidateSafetyState::Safe;
+        index.upsert(held);
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1),
+            vec![blocked]
+        );
     }
 
     #[test]
