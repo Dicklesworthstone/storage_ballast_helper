@@ -128,7 +128,8 @@ use crate::scanner::patterns::{
     StructuralSignals,
 };
 use crate::scanner::planner::{
-    PlanObjective, PlanRequest, RiskBudgetByLevel, partition_batch, plan_batch,
+    PlanObjective, PlanRequest, RiskBudgetByLevel, SafetyObservation, partition_batch, plan_batch,
+    rejected_scopes,
 };
 use crate::scanner::prescan_cursor::{PrescanCursor, RootPage, ShallowDisposition, ShallowPoll};
 use crate::scanner::protection::{self, ProtectionRegistry};
@@ -144,8 +145,8 @@ use crate::scanner::scoring::{
     ScoringEngine, cache_redeletion_counts, is_warm_cache,
 };
 use crate::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkDispatchCursor,
-    WalkEntry, WalkStream, WalkerConfig, collect_active_reference_index_cached,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, FsIdentity,
+    WalkDispatchCursor, WalkEntry, WalkStream, WalkerConfig, collect_active_reference_index_cached,
     collect_open_path_ancestors_cached,
 };
 
@@ -13596,6 +13597,232 @@ struct PassDispatch {
     bytes: u64,
 }
 
+/// Safety observations outlive ranking windows, queue retries and the transition
+/// from shallow discovery to the recursive walk. A low-ranking observation
+/// can connect a veto to a different spelling of the same subtree.
+#[derive(Default)]
+struct ScanSafety {
+    observations: HashMap<(PathBuf, Option<FsIdentity>), bool>,
+    // A no-follow walk through disjoint canonical roots on one mount per device has a
+    // unique spelling for each directory. Otherwise an unfinished branch
+    // could reveal an alias of any candidate on the same filesystem.
+    isolated_roots: Vec<PathBuf>,
+    root_devices: HashMap<PathBuf, u64>,
+    unclassified_parents: HashMap<PathBuf, bool>,
+}
+
+impl ScanSafety {
+    fn new(roots: &[PathBuf], follow_links: bool, platform: &dyn Platform) -> Self {
+        let mut result = Self::default();
+        for root in roots {
+            result.observe(
+                root,
+                crate::scanner::walker::identity_for_path(root, true).ok(),
+                false,
+            );
+        }
+        if follow_links {
+            return result;
+        }
+        let Ok(mounts) = platform.mount_points() else {
+            return result;
+        };
+        let mut bindings = Vec::new();
+        for root in roots {
+            let (Ok(real), Ok(id)) = (
+                std::fs::canonicalize(root),
+                crate::scanner::walker::identity_for_path(root, true),
+            ) else {
+                // An unresolved scan root might be another route to any device.
+                return result;
+            };
+            result.root_devices.insert(root.clone(), id.device_id);
+            bindings.push((root, real, id));
+        }
+        // Bind mounts can expose the same directory through an unrelated root.
+        // Mark both the mounted and enclosing devices ambiguous; independent
+        // volumes retain their early dispatch and partial coverage receipts.
+        let mut ambiguous = HashSet::new();
+        let mut owners = HashMap::new();
+        for (_, real, id) in &bindings {
+            if let Some(mount) = mounts
+                .iter()
+                .filter(|mount| real.starts_with(&mount.path))
+                .max_by_key(|mount| mount.path.components().count())
+            {
+                if (cfg!(target_os = "macos") && !mount.fs_type.eq_ignore_ascii_case("apfs"))
+                    || owners
+                        .insert(id.device_id, mount.path.as_path())
+                        .is_some_and(|previous| previous != mount.path)
+                {
+                    ambiguous.insert(id.device_id);
+                }
+            } else {
+                ambiguous.insert(id.device_id);
+            }
+            for mount in &mounts {
+                if mount.path != *real && mount.path.starts_with(real) {
+                    ambiguous.insert(id.device_id);
+                    let Ok(nested) = crate::scanner::walker::identity_for_path(&mount.path, true)
+                    else {
+                        return result;
+                    };
+                    ambiguous.insert(nested.device_id);
+                }
+            }
+        }
+        for (root, real, id) in &bindings {
+            // Two APFS case or Unicode spellings can coincide without sharing a
+            // lexical prefix. Compare the physical identities of the ancestors.
+            let mut ancestry = HashSet::new();
+            for ancestor in real.ancestors().skip(1) {
+                let Ok(parent) = crate::scanner::walker::identity_for_path(ancestor, true) else {
+                    ambiguous.insert(id.device_id);
+                    break;
+                };
+                ancestry.insert(parent);
+            }
+            if bindings
+                .iter()
+                .any(|(other, _, oid)| other != root && (oid == id || ancestry.contains(oid)))
+            {
+                ambiguous.insert(id.device_id);
+            }
+        }
+        result.isolated_roots = bindings
+            .into_iter()
+            .filter(|(_, _, id)| !ambiguous.contains(&id.device_id))
+            .map(|(root, _, _)| root.clone())
+            .collect();
+        result
+    }
+
+    fn observe(&mut self, path: &Path, identity: Option<FsIdentity>, vetoed: bool) {
+        *self
+            .observations
+            .entry((path.to_owned(), identity))
+            .or_default() |= vetoed;
+    }
+
+    /// The recursive walker does not score roots, Git projects or unclassified
+    /// directories. Prove that ancestry before sending a pruned unit early.
+    fn isolated_opaque(&mut self, path: &Path, patterns: &ArtifactPatternRegistry) -> bool {
+        let Some(root) = self
+            .isolated_roots
+            .iter()
+            .find(|root| path.starts_with(root))
+        else {
+            return false;
+        };
+        path != root
+            && path
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| *parent != root)
+                .all(|parent| {
+                    *self
+                        .unclassified_parents
+                        .entry(parent.to_owned())
+                        .or_insert_with(|| {
+                            if parent.join(".git").exists() {
+                                return true;
+                            }
+                            // Reuse the walk's structural evidence only from a completely
+                            // enumerated parent. Wide or unreadable parents wait for EOF.
+                            const MAX_PARENT_NAMES: usize = 256;
+                            let Ok(listing) = std::fs::read_dir(parent) else {
+                                return false;
+                            };
+                            let Ok(names) = listing
+                                .take(MAX_PARENT_NAMES + 1)
+                                .map(|entry| entry.map(|entry| entry.file_name()))
+                                .collect::<std::io::Result<Vec<_>>>()
+                            else {
+                                return false;
+                            };
+                            if names.len() > MAX_PARENT_NAMES {
+                                return false;
+                            }
+                            match crate::scanner::patterns::classify_opaque_tree_at(parent) {
+                                Some(opaque) => {
+                                    opaque.disposition == OpaqueTreeDisposition::SignalOnly
+                                }
+                                None => {
+                                    patterns
+                                        .classify(
+                                            parent,
+                                            crate::scanner::walker::signals_from_children(
+                                                names, parent,
+                                            ),
+                                        )
+                                        .category
+                                        == crate::scanner::patterns::ArtifactCategory::Unknown
+                                }
+                            }
+                        })
+                })
+    }
+
+    fn admit(&self, rows: &mut Vec<CandidacyScore>, index: Option<&ScannerCandidateIndex>) {
+        if rows.is_empty() {
+            return;
+        }
+        let latest = self
+            .observations
+            .iter()
+            .map(|((path, identity), vetoed)| SafetyObservation {
+                path,
+                identity: *identity,
+                vetoed: *vetoed,
+            });
+        let persisted = index
+            .into_iter()
+            .flat_map(ScannerCandidateIndex::safety_observations);
+        let candidates = rows.iter().map(SafetyObservation::from);
+        let rejected = rejected_scopes(candidates.chain(latest).chain(persisted));
+        let mut mask = rejected.into_iter();
+        rows.retain(|_| !mask.next().expect("one scope decision per candidate"));
+    }
+
+    fn release_covered(
+        &self,
+        ready: &mut Vec<CandidacyScore>,
+        pending: Vec<CandidacyScore>,
+        unfinished: Option<&[PathBuf]>,
+        popped: Option<&Path>,
+    ) {
+        let Some(unfinished) = unfinished else { return };
+        if unfinished.is_empty() && popped.is_none() {
+            ready.extend(pending);
+        } else {
+            ready.extend(pending.into_iter().filter(|row| {
+                let isolated = self
+                    .isolated_roots
+                    .iter()
+                    .any(|root| row.path.starts_with(root));
+                unfinished
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .chain(popped)
+                    .all(|gap| {
+                        if row.path.starts_with(gap) || gap.starts_with(&row.path) {
+                            return false;
+                        }
+                        isolated
+                            || self.isolated_roots.iter().any(|root| {
+                                gap.starts_with(root)
+                                    && self
+                                        .root_devices
+                                        .get(root)
+                                        .zip(row.identity)
+                                        .is_some_and(|(device, id)| *device != id.device_id)
+                            })
+                    })
+            }));
+        }
+    }
+}
+
 /// Keep a held candidate window from invoking the planner on every walker
 /// entry. Successful sends retain the immediate size trigger; a queue, risk,
 /// or behavior hold retries at the existing maximum-wait deadline instead.
@@ -13855,12 +14082,24 @@ fn persist_scanner_index_records(
     records: &mut Vec<CandidateIndexRecord>,
     scanner_index_path: &Path,
     logger: &ActivityLoggerHandle,
+    safety: &ScanSafety,
 ) {
-    if records.is_empty() {
-        return;
-    }
+    let mut dirty = !records.is_empty();
     for record in records.drain(..) {
         index.upsert(record);
+    }
+    // Priority, replay and recursive scoring may disagree about the same
+    // binding in one pass. Keep its direct refusal after all upserts; a
+    // separately rescored safe sibling stays independently replayable.
+    dirty |= index.remember_pass_safety(safety.observations.iter().map(
+        |((path, identity), vetoed)| SafetyObservation {
+            path,
+            identity: *identity,
+            vetoed: *vetoed,
+        },
+    ));
+    if !dirty {
+        return;
     }
     index.evict_stale(SystemTime::now());
     if let Err(err) = index.save_checkpoint(scanner_index_path) {
@@ -13919,7 +14158,7 @@ fn daemon_protection_reason(
 /// Why a replayed index record was not dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplayDrop {
-    /// The path is gone or unreadable.
+    /// A native observation established that the path no longer exists.
     Missing,
     /// Same path, different device/inode: a recreated artifact is a new
     /// decision, not the persisted one.
@@ -13935,6 +14174,17 @@ enum ReplayDrop {
 }
 
 impl ReplayDrop {
+    fn metadata_error(error: &std::io::Error) -> Self {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            Self::Missing
+        } else {
+            Self::Vetoed(format!("cannot verify indexed path: {error}"))
+        }
+    }
+
     fn label(&self) -> String {
         match self {
             Self::Missing => "missing".to_string(),
@@ -13993,9 +14243,8 @@ fn replay_indexed_record(
     if record.event_generation != index_generation {
         return Err(ReplayDrop::GenerationAdvanced);
     }
-    let Ok(identity) = identity_for_path(path, scanner_config.follow_symlinks) else {
-        return Err(ReplayDrop::Missing);
-    };
+    let identity = identity_for_path(path, scanner_config.follow_symlinks)
+        .map_err(|error| ReplayDrop::metadata_error(&error))?;
     if IndexedIdentity::from(identity) != record.identity {
         return Err(ReplayDrop::IdentityChanged);
     }
@@ -14052,9 +14301,8 @@ fn replay_indexed_record(
             "no longer classifies as an artifact".to_string(),
         ));
     }
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return Err(ReplayDrop::Missing);
-    };
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|error| ReplayDrop::metadata_error(&error))?;
     // The walker's age rule: newest of mtime, birth time and (for
     // regenerable trees) the newest mtime inside the tree.
     let mut newest = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -14131,7 +14379,7 @@ fn replay_indexed_record(
             .map_err(|e| ReplayDrop::Vetoed(format!("sacred overlap check failed: {e}")))?;
         score = engine.score_candidate_with_sacred_overlaps(&input, request.urgency, &overlaps);
     }
-    if score.vetoed {
+    if SafetyObservation::from(&score).vetoed {
         return Err(ReplayDrop::Vetoed(
             score
                 .veto_reason
@@ -15268,6 +15516,11 @@ fn scanner_thread_main(
         // dispatch zero when they are all protected/dampened.
         backoff.begin_pass();
         let mut dispatched_this_pass = PassDispatch::default();
+        let mut scan_safety = ScanSafety::new(
+            &active_scan_paths,
+            current_scanner_config.follow_symlinks,
+            platform.as_ref(),
+        );
         // Replay and the priority pre-scan may find more useful candidates
         // than fit one batch. Carry those alternatives into the walk instead
         // of discarding them when a stage hands off its first batch.
@@ -15400,6 +15653,7 @@ fn scanner_thread_main(
                         logger,
                     ) {
                         Ok(score) => {
+                            scan_safety.observe(&score.path, score.identity, false);
                             // bd-8aeq: a record the executor would only hold
                             // back is not re-dispatched; it stays in the index
                             // (no cooldown) for a cell that accepts it.
@@ -15435,10 +15689,17 @@ fn scanner_thread_main(
                                 drop.label()
                             );
                             if matches!(drop, ReplayDrop::Missing | ReplayDrop::IdentityChanged) {
-                                // Deleted (often by this daemon) or replaced:
-                                // there is nothing left to back off.
-                                index.forget(record.identity);
+                                index.forget_observation(&record.path, record.identity);
                             } else if drop != ReplayDrop::GenerationAdvanced {
+                                let vetoed = matches!(drop, ReplayDrop::Vetoed(_));
+                                scan_safety.observe(
+                                    &record.path,
+                                    Some(record.identity.into()),
+                                    vetoed,
+                                );
+                                if vetoed {
+                                    index.mark_observed_veto(&record.path, record.identity);
+                                }
                                 index.record_failure(
                                     record.identity,
                                     replay_now,
@@ -15467,60 +15728,9 @@ fn scanner_thread_main(
                     candidate.size_bytes,
                 );
             }
-            let indexed_count = indexed_candidates.len();
-            if indexed_count > 0 {
-                if !dispatch_with_behavior_gate(
-                    &mut indexed_candidates,
-                    &request,
-                    del_tx,
-                    &mut dispatched_this_pass,
-                    executor_config,
-                ) {
-                    break;
-                }
-                candidates_found += indexed_count;
-                v2_candidate_bytes_seen = dispatched_this_pass.bytes;
-                deferred_candidates.append(&mut indexed_candidates);
-                if v2_candidate_byte_target.is_some_and(|target| v2_candidate_bytes_seen >= target)
-                    && !limits.policy_changed_at(Instant::now())
-                {
-                    logger.send(ActivityEvent::ScanCompleted {
-                        paths_scanned: 0,
-                        candidates_found,
-                        duration_ms: 0,
-                        telemetry: scan_completion_telemetry(
-                            0,
-                            v2_candidate_bytes_seen,
-                            false,
-                            index.len(),
-                            None,
-                        ),
-                    });
-                    let root_stats = root_stats_map.into_values().collect();
-                    let _ = report_tx.try_send(WorkerReport::ScanCompleted {
-                        candidates: candidates_found,
-                        duration: Duration::ZERO,
-                        root_stats,
-                        timed_out: false,
-                        pressure_level: request.pressure_level,
-                        background: request_background,
-                    });
-                    if held_by_certainty > 0 {
-                        logger.send(ActivityEvent::Info {
-                            message: format!(
-                                "scanner certainty gate held {held_by_certainty} candidate(s) below {pass_min_certainty} (pressure={:?}); not dispatched, not counted toward the reclaim byte target",
-                                request.pressure_level
-                            ),
-                        });
-                    }
-                    backoff.record_dispatch(
-                        Arc::clone(&dispatched_this_pass.progress),
-                        request.predictive_reclaim.clone(),
-                    );
-                    backoff.last_pass_level = Some(request_level);
-                    continue;
-                }
-            }
+            // The shallow stage can still discover a separately protected
+            // child inside a replayed tree. Nomination alone cannot end a pass.
+            deferred_candidates.append(&mut indexed_candidates);
         }
 
         let active_reference_scan = ActiveReferenceScanConfig::new(
@@ -15563,6 +15773,7 @@ fn scanner_thread_main(
         // budget is re-examined from its first entry forever — the fleet's
         // `0 entries, 0 candidates` passes.
         let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
+        let mut shallow_completed = HashSet::new();
         let mut prescan_stop: Option<PassStop> = None;
         let mut prescan_entries: usize = 0;
         if request.force_full_scan && request.scan_now.is_none() && !request.has_resource_reclaim()
@@ -15644,6 +15855,7 @@ fn scanner_thread_main(
                         break 'priority_roots;
                     }
                     prescan_entries += 1;
+                    let resumed = cursor.resumes_shallow_entry(root, &path);
                     // Score nominees as they arrive, before acknowledging
                     // their names. A finite slice retains the exact shallow
                     // branch instead of dropping `to_score` or skipping the
@@ -15672,6 +15884,9 @@ fn scanner_thread_main(
                         let candidate = match polled {
                             Ok(ShallowPoll::Candidate(candidate)) => candidate,
                             Ok(ShallowPoll::Complete) => {
+                                if !resumed {
+                                    shallow_completed.insert(path.clone());
+                                }
                                 cursor.advance(root, &path);
                                 break;
                             }
@@ -15702,6 +15917,15 @@ fn scanner_thread_main(
                                 logger,
                                 "priority pre-scan",
                             ) {
+                                scan_safety.observe(
+                                    &candidate_path,
+                                    crate::scanner::walker::identity_for_path(
+                                        &candidate_path,
+                                        false,
+                                    )
+                                    .ok(),
+                                    true,
+                                );
                                 break 'score_candidate;
                             }
                             // One read_dir of the candidate gives the pre-scan
@@ -15835,6 +16059,7 @@ fn scanner_thread_main(
                                 ) {
                                     Ok(overlaps) => overlaps,
                                     Err(err) => {
+                                        scan_safety.observe(&candidate_path, None, true);
                                         logger.send(ActivityEvent::Error {
                                             code: err.code().to_string(),
                                             message: format!(
@@ -15851,51 +16076,59 @@ fn scanner_thread_main(
                                     &sacred_overlaps,
                                 );
                             }
+                            score.identity = crate::scanner::walker::identity_for_path(
+                                &candidate_path,
+                                current_scanner_config.follow_symlinks,
+                            )
+                            .ok();
+                            let observation = SafetyObservation::from(&score);
+                            let vetoed = observation.vetoed;
+                            scan_safety.observe(
+                                observation.path,
+                                observation.identity,
+                                observation.vetoed,
+                            );
+                            // Before the index record is made: the record's
+                            // size is what every later replay dispatches and
+                            // reports. Recording the 100 MiB nomination floor
+                            // made fmd log 73 GB "freed" for a few MB of tiny
+                            // node_modules (2026-09-29), and the byte target
+                            // counted that fiction as progress.
+                            if let Some(measured) = measured_size {
+                                score.size_bytes = measured;
+                            }
+                            let mut scanner_index_backoff_active = false;
+                            if scanner_index_enabled {
+                                match CandidateIndexRecord::from_candidate_score(
+                                    &score,
+                                    None,
+                                    input.signals,
+                                    scanner_index_event_generation,
+                                ) {
+                                    Ok(Some(record)) => {
+                                        scanner_index_backoff_active =
+                                            scanner_index.as_ref().is_some_and(|index| {
+                                                index.candidate_in_cooldown(
+                                                    &record,
+                                                    SystemTime::now(),
+                                                )
+                                            });
+                                        scanner_index_records.push(record);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => logger.send(ActivityEvent::Error {
+                                        code: err.code().to_string(),
+                                        message: format!(
+                                            "scanner_index: failed to record {}: {err}",
+                                            candidate_path.display()
+                                        ),
+                                    }),
+                                }
+                            }
                             if score.decision.action
                                 == crate::scanner::scoring::DecisionAction::Delete
+                                && !vetoed
                             {
-                                score.identity = crate::scanner::walker::identity_for_path(
-                                    &candidate_path,
-                                    current_scanner_config.follow_symlinks,
-                                )
-                                .ok();
-                                // Before the index record is made: the record's
-                                // size is what every later replay dispatches and
-                                // reports. Recording the 100 MiB nomination floor
-                                // made fmd log 73 GB "freed" for a few MB of tiny
-                                // node_modules (2026-09-29), and the byte target
-                                // counted that fiction as progress.
-                                if let Some(measured) = measured_size {
-                                    score.size_bytes = measured;
-                                }
-                                let mut scanner_index_backoff_active = false;
-                                if scanner_index_enabled {
-                                    match CandidateIndexRecord::from_candidate_score(
-                                        &score,
-                                        None,
-                                        input.signals,
-                                        scanner_index_event_generation,
-                                    ) {
-                                        Ok(Some(record)) => {
-                                            scanner_index_backoff_active =
-                                                scanner_index.as_ref().is_some_and(|index| {
-                                                    index.candidate_in_cooldown(
-                                                        &record,
-                                                        SystemTime::now(),
-                                                    )
-                                                });
-                                            scanner_index_records.push(record);
-                                        }
-                                        Ok(None) => {}
-                                        Err(err) => logger.send(ActivityEvent::Error {
-                                            code: err.code().to_string(),
-                                            message: format!(
-                                                "scanner_index: failed to record {}: {err}",
-                                                candidate_path.display()
-                                            ),
-                                        }),
-                                    }
-                                }
                                 if score.decision.certainty < pass_min_certainty
                                     || !request.permits_reclaim_candidate(&score)
                                 {
@@ -15959,7 +16192,31 @@ fn scanner_thread_main(
             persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
         }
 
-        // Dispatch priority candidates immediately if any found.
+        // A hint whose walk descends into it still needs that walk's verdict.
+        // Only proven opaque units with no independent entry point can spend
+        // the byte target before recursive observations have arrived.
+        let fresh_shallow: HashSet<_> = priority_candidates
+            .iter()
+            .map(|row| (row.path.clone(), row.identity))
+            .collect();
+        priority_candidates.append(&mut deferred_candidates);
+        let mut pending_hints = Vec::new();
+        if request.max_delete_batch > 0 {
+            (priority_candidates, pending_hints) =
+                priority_candidates.into_iter().partition(|candidate| {
+                    scanner_opaque_pruning
+                        && scan_safety.isolated_opaque(&candidate.path, &pattern_registry)
+                        && (!active_scan_paths
+                            .iter()
+                            .any(|root| candidate.path.parent() == Some(root))
+                            || shallow_completed.contains(&candidate.path))
+                        && crate::scanner::patterns::classify_opaque_tree_at(&candidate.path)
+                            .is_some_and(|opaque| {
+                                opaque.disposition == OpaqueTreeDisposition::CandidateOpaque
+                            })
+                });
+            scan_safety.admit(&mut priority_candidates, scanner_index.as_ref());
+        }
         if !priority_candidates.is_empty() {
             for candidate in &priority_candidates {
                 record_root_candidate(
@@ -16046,6 +16303,7 @@ fn scanner_thread_main(
                     &mut scanner_index_records,
                     scanner_index_path,
                     logger,
+                    &scan_safety,
                 );
             }
             let process_cpu_micros = scan_start_cpu_micros
@@ -16103,6 +16361,7 @@ fn scanner_thread_main(
                     &mut scanner_index_records,
                     scanner_index_path,
                     logger,
+                    &scan_safety,
                 );
             }
             let process_cpu_micros = scan_start_cpu_micros
@@ -16241,6 +16500,18 @@ fn scanner_thread_main(
             drop(walker_config);
             drop(protection);
             let (entries, skipped_young) = catalog_walk_entries(&request.catalog_roots);
+            let probed: HashSet<_> = entries.iter().map(|entry| &entry.path).collect();
+            for omitted in request
+                .catalog_roots
+                .iter()
+                .filter(|root| !probed.contains(&root.path))
+            {
+                scan_safety.observe(
+                    &omitted.path,
+                    crate::scanner::walker::identity_for_path(&omitted.path, false).ok(),
+                    true,
+                );
+            }
             let message = format!(
                 "catalog scan: {} root(s) probed, {} skipped as recently used, {} candidate unit(s): {}",
                 request.catalog_roots.len(),
@@ -16277,6 +16548,9 @@ fn scanner_thread_main(
         let mut walk_exhausted = false;
         let mut opaque_pruned_dirs = 0usize;
         let mut scored = deferred_candidates;
+        let mut awaiting_coverage: Vec<CandidacyScore> = Vec::new();
+        let mut confirmed_opaque = HashSet::new();
+        let mut unprocessed_entry = None;
 
         // Track directories for the incremental scan cursor.
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
@@ -16348,6 +16622,7 @@ fn scanner_thread_main(
                 // The popped entry is no longer in the stream's unfinished
                 // receipt. Keep its ancestors eligible for the next pass.
                 mark_non_barren(&mut non_barren_dirs, &entry.path);
+                unprocessed_entry = Some(entry.path.clone());
                 cancel_token.store(true, Ordering::Relaxed);
                 scan_timed_out = true;
                 walk_stop = Some(PassStop::ScanPosture);
@@ -16369,6 +16644,7 @@ fn scanner_thread_main(
                 // Receiving removed this unprocessed entry from the stream's
                 // unfinished receipt. Its ancestors still need another pass.
                 mark_non_barren(&mut non_barren_dirs, &entry.path);
+                unprocessed_entry = Some(entry.path.clone());
                 cancel_token.store(true, Ordering::Relaxed);
                 scan_timed_out = true;
                 walk_stop = stop;
@@ -16385,38 +16661,44 @@ fn scanner_thread_main(
             if entry.metadata.is_dir {
                 visited_dirs.insert(entry.path.clone());
             }
+            let identity = Some(entry.metadata.identity());
+            scan_safety.observe(&entry.path, identity, false);
 
             // Skip directories already known to contain .git (project roots).
             if entry.metadata.is_dir && known_git_dirs.contains(&entry.path) {
+                scan_safety.observe(&entry.path.join(".git"), None, true);
                 continue;
             }
 
             // Classify.
-            let (classification, classified_tree_modified) = if let Some(opaque_tree) =
-                &entry.opaque_tree
-            {
-                match opaque_tree.disposition {
-                    OpaqueTreeDisposition::CandidateOpaque => {
-                        opaque_pruned_dirs += 1;
-                        logger.send(ActivityEvent::Info {
-                            message: format!(
-                                "opaque_prune: disposition=CandidateOpaque reason={} path={}",
-                                opaque_tree.reason,
-                                entry.path.display()
-                            ),
-                        });
-                        (
-                            opaque_tree.classification.clone(),
-                            opaque_tree.tree_last_modified,
-                        )
+            let (classification, classified_tree_modified) =
+                if let Some(opaque_tree) = &entry.opaque_tree {
+                    match opaque_tree.disposition {
+                        OpaqueTreeDisposition::CandidateOpaque => {
+                            opaque_pruned_dirs += 1;
+                            logger.send(ActivityEvent::Info {
+                                message: format!(
+                                    "opaque_prune: disposition=CandidateOpaque reason={} path={}",
+                                    opaque_tree.reason,
+                                    entry.path.display()
+                                ),
+                            });
+                            (
+                                opaque_tree.classification.clone(),
+                                opaque_tree.tree_last_modified,
+                            )
+                        }
+                        OpaqueTreeDisposition::ProtectedOpaque => {
+                            scan_safety.observe(&entry.path, identity, true);
+                            continue;
+                        }
+                        OpaqueTreeDisposition::SignalOnly => {
+                            continue;
+                        }
                     }
-                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
-                        continue;
-                    }
-                }
-            } else {
-                pattern_registry.classify_with_freshness(&entry.path, entry.structural_signals)
-            };
+                } else {
+                    pattern_registry.classify_with_freshness(&entry.path, entry.structural_signals)
+                };
             // Age means idleness of the whole tree for regenerable categories:
             // the opaque probe recorded the newest mtime for pruned trees, and
             // a bounded sample covers v1-walked build/cache directories.
@@ -16438,6 +16720,7 @@ fn scanner_thread_main(
             // missed (deeper directories, newly created repos).
             if entry.metadata.is_dir && entry.path.join(".git").exists() {
                 known_git_dirs.insert(entry.path.clone());
+                scan_safety.observe(&entry.path.join(".git"), None, true);
                 continue;
             }
 
@@ -16550,6 +16833,7 @@ fn scanner_thread_main(
                     match protection::find_sacred_overlaps(&entry.path, &sacred_paths) {
                         Ok(overlaps) => overlaps,
                         Err(err) => {
+                            scan_safety.observe(&entry.path, identity, true);
                             logger.send(ActivityEvent::Error {
                                 code: err.code().to_string(),
                                 message: format!(
@@ -16587,6 +16871,8 @@ fn scanner_thread_main(
             }
 
             score.identity = Some(entry.metadata.identity());
+            let observation = SafetyObservation::from(&score);
+            scan_safety.observe(observation.path, observation.identity, observation.vetoed);
             let mut scanner_index_backoff_active = false;
             if scanner_index_enabled {
                 match CandidateIndexRecord::from_candidate_score(
@@ -16625,7 +16911,7 @@ fn scanner_thread_main(
 
             let deletable = score.decision.action
                 == crate::scanner::scoring::DecisionAction::Delete
-                && !score.vetoed;
+                && !observation.vetoed;
             if deletable
                 && (score.decision.certainty < pass_min_certainty
                     || !request.permits_reclaim_candidate(&score))
@@ -16646,7 +16932,29 @@ fn scanner_thread_main(
                     &score.path,
                     potential_bytes,
                 );
-                scored.push(score);
+                let opaque = entry.opaque_tree.is_some();
+                if opaque
+                    && request.catalog_roots.is_empty()
+                    && active_scan_paths
+                        .iter()
+                        .any(|root| entry.path.parent() == Some(root))
+                    && !shallow_completed.contains(&entry.path)
+                {
+                    // The recursive walk pruned this unit. Its EOF cannot
+                    // supply the missing prefix of a separate shallow walk.
+                    continue;
+                }
+                if opaque {
+                    confirmed_opaque.insert(entry.path.clone());
+                }
+                if opaque
+                    && request.catalog_roots.is_empty()
+                    && scan_safety.isolated_opaque(&entry.path, &pattern_registry)
+                {
+                    scored.push(score);
+                } else {
+                    awaiting_coverage.push(score);
+                }
             } else if score.vetoed
                 && let Some(root) = root_path
                 && let Some(stat) = root_stats_map.get_mut(root)
@@ -16658,6 +16966,7 @@ fn scanner_thread_main(
             // On very large trees this starts reclaim work earlier and avoids long periods with
             // zero deletion progress while the scanner is still traversing.
             if dispatch_pacer.should_attempt(scored.len(), Instant::now()) {
+                scan_safety.admit(&mut scored, scanner_index.as_ref());
                 let dispatched_before = dispatched_this_pass.count;
                 if !dispatch_with_behavior_gate(
                     &mut scored,
@@ -16692,8 +17001,10 @@ fn scanner_thread_main(
             scan_timed_out = true;
             walk_stop = Some(PassStop::PolicyChanged);
         }
+        let omissions = rx.omitted_scopes();
         let mut walk_stopped = false;
         let mut completed_walk = None;
+        let mut partial_walk = None;
         if walk_exhausted
             && request.catalog_roots.is_empty()
             && !scan_timed_out
@@ -16725,7 +17036,63 @@ fn scanner_thread_main(
                 );
                 visited_dirs.clear();
             }
+            partial_walk = unfinished;
         }
+
+        // Only the final consumer receipt includes unread batches, worker-owned
+        // directories and partially enumerated windows. A popped, unscored
+        // entry stopped on the budget belongs to that same unfinished set.
+        // Catalog recovery works from a finite list of independently probed
+        // units. Its complete stream can likewise be admitted as one snapshot.
+        let catalog_complete =
+            !request.catalog_roots.is_empty() && walk_exhausted && !scan_timed_out;
+        // Prefer the newer walked verdict when both tracks saw the same object.
+        // A shallow candidate below an opaque unit is deliberately hidden from
+        // this walk; its enclosing unit and full shallow page must both have
+        // current receipts. Other missing hints may be stale or excluded.
+        let mut hint_paths = HashSet::new();
+        for hint in pending_hints {
+            if !visited_dirs.contains(&hint.path)
+                && fresh_shallow.contains(&(hint.path.clone(), hint.identity))
+                && hint
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .any(|path| confirmed_opaque.contains(path))
+                && hint
+                    .path
+                    .ancestors()
+                    .any(|path| shallow_completed.contains(path))
+                && hint_paths.insert(hint.path.clone())
+            {
+                record_root_candidate(
+                    &mut root_stats_map,
+                    &mut observed_candidates,
+                    &hint.path,
+                    hint.size_bytes,
+                );
+                candidates_found += 1;
+                awaiting_coverage.push(hint);
+            }
+        }
+        if catalog_complete {
+            scored.append(&mut awaiting_coverage);
+        } else {
+            if prewalk_stop.is_none()
+                && let Some(unfinished) = completed_walk.as_ref().or(partial_walk.as_ref())
+                && let Some(omitted) = omissions.lock().as_ref()
+            {
+                let mut gaps = unfinished.clone();
+                gaps.extend(omitted.iter().cloned());
+                scan_safety.release_covered(
+                    &mut scored,
+                    awaiting_coverage,
+                    Some(&gaps),
+                    unprocessed_entry.as_deref(),
+                );
+            }
+        }
+        scan_safety.admit(&mut scored, scanner_index.as_ref());
 
         // Flush before completion accounting so a pass whose only successful
         // sends happen here reports their bytes too. Retained alternatives do
@@ -16856,6 +17223,7 @@ fn scanner_thread_main(
                 &mut scanner_index_records,
                 scanner_index_path,
                 logger,
+                &scan_safety,
             );
         }
 
@@ -39178,6 +39546,64 @@ mod tests {
         logger_join.join().unwrap();
     }
 
+    #[cfg(unix)]
+    fn run_scanner_queue_fixture(
+        scratch: &Path,
+        config: &Config,
+        current: ScannerConfig,
+        request: ScanRequest,
+        regret: &Arc<SharedRegret>,
+    ) -> (Vec<PathBuf>, bool) {
+        let (scan_tx, scan_rx) = bounded(1);
+        scan_tx.send(request).unwrap();
+        drop(scan_tx);
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: scratch.join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (del_tx, del_rx) = bounded(16);
+        let (report_tx, report_rx) = bounded(2);
+        let (_feedback_tx, feedback_rx) = bounded(1);
+        let (index_path, cursor_path) = scanner_state_paths(scratch);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &Arc::new(RwLock::new(config.scoring.clone())),
+            &Arc::new(RwLock::new(current)),
+            &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
+            &ThreadHeartbeat::new("queued-root-test"),
+            &report_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &index_path,
+            &cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
+            regret,
+            None,
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+        let dispatched: Vec<_> = del_rx
+            .try_iter()
+            .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
+            .collect();
+        (dispatched, report_rx.try_recv().is_ok())
+    }
+
     /// The request queue is an admission boundary too: a reload must not
     /// let the scanner manufacture fresh batches from withdrawn root paths.
     #[cfg(unix)]
@@ -39214,76 +39640,101 @@ mod tests {
             config.scanner.active_reference_min_size_bytes = u64::MAX;
             config.scanner.log_truncation.enabled = false;
             config.scoring.min_score = 0.0;
-            let (scan_tx, scan_rx) = bounded(1);
             let mut request = event_test_request(vec![root]);
             request.admitted_scanner = Arc::new(config.scanner.clone());
             request.pressure_level = PressureLevel::Critical;
             request.urgency = 1.0;
-            scan_tx.send(request).unwrap();
-            drop(scan_tx);
             let mut current = config.scanner.clone();
             match case {
                 "removed root" => current.root_paths.clear(),
                 "scheduling" => current.parallelism += 1,
                 _ => {}
             }
-            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
-                sqlite_path: None,
-                jsonl_config: crate::logger::jsonl::JsonlConfig {
-                    path: temp.path().join("activity.jsonl"),
-                    fallback_path: None,
-                    max_size_bytes: 1_048_576,
-                    max_rotated_files: 0,
-                    fsync_interval_secs: 0,
-                },
-                channel_capacity: 64,
-                run_id: None,
-            })
-            .unwrap();
-            let (del_tx, del_rx) = bounded(16);
-            let (report_tx, report_rx) = bounded(2);
-            let (_feedback_tx, feedback_rx) = bounded(1);
-            let (index_path, cursor_path) = scanner_state_paths(temp.path());
-            scanner_thread_main(
-                &scan_rx,
-                &del_tx,
-                &logger,
-                &Arc::new(RwLock::new(config.scoring.clone())),
-                &Arc::new(RwLock::new(current)),
-                &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
-                &ThreadHeartbeat::new("queued-root-test"),
-                &report_tx,
-                &Arc::new(AtomicBool::new(false)),
-                &index_path,
-                &cursor_path,
-                &feedback_rx,
-                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
-                &Arc::new(SharedExecutorConfig::new(
-                    false, 10, 0.0, 60, 3600, false, 0,
-                )),
+            let (dispatched, reported) = run_scanner_queue_fixture(
+                temp.path(),
+                &config,
+                current,
+                request,
                 &Arc::new(SharedRegret::new(&config)),
-                None,
-                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
-            logger.shutdown();
-            logger_join.join().unwrap();
-            let dispatched: Vec<_> = del_rx
-                .try_iter()
-                .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
-                .collect();
             let allowed = case != "removed root";
             assert_eq!(
                 dispatched.contains(&target),
                 allowed,
                 "{case}: {dispatched:?}"
             );
-            assert_eq!(report_rx.try_recv().is_ok(), allowed, "{case}");
+            assert_eq!(reported, allowed, "{case}");
             assert_eq!(
                 std::fs::read(target.join("debug/deps/libqueued.rlib")).unwrap(),
                 [0xA5_u8; 8192],
                 "the scanner only proposes work",
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_holds_priority_parent_above_a_later_walk_veto_and_dispatches_safe_peer() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let held = root.join("held-project/target");
+        let peer = root.join("peer-project/target");
+        for target in [&held, &peer] {
+            for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+                std::fs::create_dir_all(target.join(child)).unwrap();
+            }
+            std::fs::write(
+                target.parent().unwrap().join("Cargo.toml"),
+                "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+            )
+            .unwrap();
+            write_cargo_cachedir_tag(target);
+            std::fs::write(target.join("debug/deps/libfixture.rlib"), [0xa5_u8; 8192]).unwrap();
+        }
+        // Shallow discovery nominates the cargo target and stops there. Only
+        // the recursive walk scores this differently classified descendant.
+        let suspended = held.join("debug/generated/__pycache__");
+        std::fs::create_dir_all(&suspended).unwrap();
+        std::fs::write(suspended.join("fixture.pyc"), [0u8; 4096]).unwrap();
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.engine = ScannerEngineMode::V1;
+        config.scanner.parallelism = 1;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.scoring.min_score = 0.0;
+        let regret = Arc::new(SharedRegret::new(&config));
+        {
+            let mut calibration = regret.calibrator.lock();
+            for _ in 0..3 {
+                calibration.record(
+                    "PythonCache",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    Instant::now(),
+                );
+            }
+            assert!(calibration.suspended("PythonCache", Instant::now()));
+        }
+        let mut request = event_test_request_for_config(vec![root], &config.scanner);
+        request.pressure_level = PressureLevel::Critical;
+        request.urgency = 1.0;
+        let (sent, reported) = run_scanner_queue_fixture(
+            temp.path(),
+            &config,
+            config.scanner.clone(),
+            request,
+            &regret,
+        );
+        assert!(reported);
+        assert!(
+            sent.contains(&peer),
+            "independent cargo target missing from {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|path| suspended.starts_with(path)),
+            "a dispatched scope would erase the suspended cache: {sent:?}"
+        );
     }
 
     /// trj 2026-11-13: `/data/tmp/rch/ft-dsr-qualification-1031-c91` was a
@@ -47424,6 +47875,66 @@ mod tests {
         config.max_batch_size.store(usize::MAX, Ordering::Relaxed);
         request.max_delete_batch = usize::MAX;
         assert_eq!(scanner_replay_limit(&request, &config), SCAN_ENTRY_BUDGET);
+    }
+
+    #[test]
+    fn scanner_receipts_hold_unseen_or_vetoed_scopes_and_keep_independent_siblings() {
+        let path = |p: &str| PathBuf::from(p);
+        let mut evidence = ScanSafety {
+            isolated_roots: vec![path("/scratch")],
+            ..Default::default()
+        };
+        let parent = test_candidate("/scratch/cache", 1.0);
+        let sibling = test_candidate("/scratch/peer", 0.9);
+        let rows = || vec![parent.clone(), sibling.clone()];
+        let mut ready = Vec::new();
+        evidence.release_covered(&mut ready, rows(), None, None);
+        assert!(ready.is_empty(), "a live worker can still produce a veto");
+        for popped in [false, true] {
+            let unread = path("/scratch/cache/child");
+            let receipt = if popped {
+                Vec::new()
+            } else {
+                vec![unread.clone()]
+            };
+            evidence.release_covered(
+                &mut ready,
+                rows(),
+                Some(&receipt),
+                popped.then_some(unread.as_path()),
+            );
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready.pop().unwrap().path, sibling.path);
+        }
+        let id = FsIdentity {
+            device_id: 1,
+            inode: 42,
+            kind: crate::scanner::walker::FsEntryKind::Directory,
+        };
+        evidence.observe(&parent.path, Some(id), false);
+        evidence.observe(Path::new("/mirror/cache"), Some(id), false);
+        evidence.observe(Path::new("/mirror/cache/held"), None, true);
+        evidence.release_covered(&mut ready, rows(), Some(&[]), None);
+        evidence.admit(&mut ready, None);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready.pop().unwrap().path, sibling.path);
+        evidence.isolated_roots.clear();
+        evidence.release_covered(&mut ready, rows(), Some(&[path("/unseen/alias")]), None);
+        assert!(ready.is_empty(), "an unseen alias can contain the veto");
+        let mut other_device = sibling;
+        other_device.identity = Some(id);
+        evidence.isolated_roots.push(path("/other-device"));
+        evidence.root_devices.insert(path("/other-device"), 7);
+        evidence.release_covered(
+            &mut ready,
+            vec![other_device.clone()],
+            Some(&[path("/other-device/omitted")]),
+            None,
+        );
+        assert_eq!(
+            ready[0].path, other_device.path,
+            "another volume cannot contain its alias"
+        );
     }
 
     #[test]

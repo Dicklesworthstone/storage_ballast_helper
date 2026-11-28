@@ -146,6 +146,15 @@ fn direct_child(parent: &Path, child: &Path) -> bool {
 }
 
 impl PrescanCursor {
+    /// Whether polling this entry would resume below a previously inspected
+    /// part of the branch. A suffix alone cannot certify a whole opaque unit.
+    pub(crate) fn resumes_shallow_entry(&self, root: &Path, entry: &Path) -> bool {
+        self.shallow.get(root).is_some_and(|position| {
+            position.entry == entry
+                && (!position.frames.is_empty() || position.pending.as_deref() != Some(entry))
+        })
+    }
+
     /// Continue a depth-1 entry through depth 3, checking the live budget
     /// between every inspection and between bounded enumeration chunks.
     /// `inspect` must revalidate scope, directory type, symlinks, and protection.

@@ -611,6 +611,10 @@ impl ScannerCandidateIndex {
                     }
                     self.paths.insert(promoted.path.clone(), identity);
                     self.records.insert(identity, promoted);
+                } else {
+                    // No binding remains. Orphaned aliases cannot restore
+                    // this identity and must not poison a future checkpoint.
+                    self.aliases.retain(|_, alias| alias.identity != identity);
                 }
             }
         } else if self
@@ -646,6 +650,67 @@ impl ScannerCandidateIndex {
         }
     }
 
+    /// Publish the pass's direct safety evidence after all score upserts.
+    /// Unclassified directory spellings are stored only when they establish
+    /// an observed identity bridge. A bridge is evidence, not a nomination.
+    pub(crate) fn remember_pass_safety<'a>(
+        &mut self,
+        observations: impl IntoIterator<Item = SafetyObservation<'a>>,
+    ) -> bool {
+        let mut first = std::collections::HashMap::new();
+        let mut dirty = false;
+        for row in observations {
+            let Some(identity) = row.identity.map(IndexedIdentity::from) else {
+                continue;
+            };
+            if row.vetoed {
+                self.mark_observed_veto(row.path, identity);
+                // Replay may already have applied it to the in-memory index.
+                dirty = true;
+            }
+            if identity.kind != IndexedEntryKind::Directory {
+                continue;
+            }
+            let earlier = first.entry(identity).or_insert(row.path);
+            if *earlier != row.path {
+                dirty |= self.remember_bridge(earlier, identity);
+                dirty |= self.remember_bridge(row.path, identity);
+            } else if self
+                .records
+                .get(&identity)
+                .is_some_and(|record| record.path != row.path)
+            {
+                dirty |= self.remember_bridge(row.path, identity);
+            }
+        }
+        dirty
+    }
+
+    fn remember_bridge(&mut self, path: &Path, identity: IndexedIdentity) -> bool {
+        if self.paths.get(path) == Some(&identity)
+            || self
+                .aliases
+                .get(path)
+                .is_some_and(|row| row.identity == identity)
+        {
+            return false;
+        }
+        let Ok(Some(row)) =
+            CandidateIndexRecord::from_binding(path, identity, self.event_generation)
+        else {
+            return false;
+        };
+        if !self.records.contains_key(&identity) {
+            self.upsert(row);
+        } else {
+            if let Some(displaced) = self.paths.get(path).copied() {
+                self.forget_observation(path, displaced);
+            }
+            self.aliases.insert(path.to_owned(), row);
+        }
+        true
+    }
+
     /// Drop records that can neither be replayed nor hold a candidate back:
     /// written before the current event generation, not cooling down, and
     /// either never failed or no longer present. A walk that sees the path
@@ -671,14 +736,13 @@ impl ScannerCandidateIndex {
             }
         }
         self.records.retain(|_, record| {
-            // When a scoped change revoked an old veto, disappearance or
-            // replacement is positive evidence that the old binding is gone.
-            if record.score.is_none() && record.safety_state.is_veto() {
+            // Confirmed disappearance or replacement releases a veto even
+            // when the event feed missed the change. An I/O error retains it.
+            if record.safety_state.is_veto() {
                 return record.may_still_name_object();
             }
             record.event_generation == generation
-                || ((record.safety_state.is_veto() || alias_ids.contains(&record.identity))
-                    && record.may_still_name_object())
+                || (alias_ids.contains(&record.identity) && record.may_still_name_object())
                 || record
                     .cooldown_until_nanos
                     .is_some_and(|until| now_nanos < until)
@@ -1113,6 +1177,73 @@ mod tests {
                 .is_empty(),
             "stale alternate metadata requires a fresh walk"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unclassified_alias_bridges_keep_recursive_replay_safe_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let alternate = tmp.path().join("alternate");
+        let bridge = target.join("bridge");
+        let other_bridge = alternate.join("bridge");
+        let hold = other_bridge.join("hold");
+        let peer = tmp.path().join("peer");
+        let ordinary = target.join("ordinary");
+        fs::create_dir_all(bridge.join("hold")).unwrap();
+        fs::create_dir(&ordinary).unwrap();
+        fs::create_dir(&peer).unwrap();
+        std::os::unix::fs::symlink(&target, &alternate).unwrap();
+        let binding = |path: &Path| identity_from_metadata(&fs::symlink_metadata(path).unwrap());
+        let ctx = context("pass-bridges");
+        let mut index = ScannerCandidateIndex::new(ctx.clone());
+        for path in [&target, &peer] {
+            let mut row = CandidateIndexRecord::from_binding(path, binding(path), 0)
+                .unwrap()
+                .unwrap();
+            row.score = Some(1.0);
+            row.size_estimate_bytes = 10;
+            row.safety_state = CandidateSafetyState::Safe;
+            index.upsert(row);
+        }
+        assert!(
+            index.remember_pass_safety([&hold, &ordinary, &other_bridge, &bridge].map(|path| {
+                SafetyObservation {
+                    path,
+                    identity: Some(binding(path).into()),
+                    vetoed: path == &hold,
+                }
+            }))
+        );
+        assert!(index.get(binding(&ordinary)).is_none());
+        let checkpoint = tmp.path().join("index.json");
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (restored, status) = ScannerCandidateIndex::load_checkpoint(&checkpoint, ctx);
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        let ranked = restored.ranked_records(UNIX_EPOCH, 10);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].path, peer);
+
+        // The event feed can miss a move. Even a scored hold must expire
+        // when its old path is confirmed gone, without a generation change.
+        let mut restored = restored;
+        let mut scored_hold = restored.get(binding(&hold)).unwrap().clone();
+        scored_hold.score = Some(0.5);
+        restored.upsert(scored_hold);
+        fs::rename(&hold, other_bridge.join("moved")).unwrap();
+        assert_eq!(restored.evict_stale(UNIX_EPOCH), 1);
+        assert_eq!(restored.ranked_records(UNIX_EPOCH, 10).len(), 2);
+
+        // Both bridge spellings disappear. A path-specific failure cannot
+        // leave unowned alias rows that invalidate the entire checkpoint.
+        let id = binding(&bridge);
+        let primary = restored.get(id).unwrap().path.clone();
+        fs::rename(&bridge, target.join("moved-bridge")).unwrap();
+        restored.forget_observation(&primary, id);
+        restored.save_checkpoint(&checkpoint).unwrap();
+        let (_, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, context("pass-bridges"));
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
     }
 
     #[test]

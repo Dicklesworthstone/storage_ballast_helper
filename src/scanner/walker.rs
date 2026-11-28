@@ -449,6 +449,8 @@ pub struct WalkStream {
     work: Option<Arc<WorkQueue>>,
     /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
     unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    /// Policy and depth boundaries that a completed traversal deliberately skipped.
+    omitted: Arc<parking_lot::Mutex<Option<HashSet<PathBuf>>>>,
     /// The walk's cancel flag (the walker's [`DirectoryWalker::cancel_token`]).
     cancel: Arc<AtomicBool>,
 }
@@ -465,8 +467,16 @@ impl WalkStream {
             pending: Vec::new().into_iter(),
             work,
             unfinished,
+            omitted: Arc::new(parking_lot::Mutex::new(Some(HashSet::new()))),
             cancel,
         }
+    }
+
+    /// Read only after receiving the final worker receipt. None means too many
+    /// omissions to retain a precise set. Scheduling still treats an intentional
+    /// skip as complete; cleanup cannot infer coverage across that boundary.
+    pub(crate) fn omitted_scopes(&self) -> Arc<parking_lot::Mutex<Option<HashSet<PathBuf>>>> {
+        Arc::clone(&self.omitted)
     }
 
     /// A stream of entries already in hand, such as a catalog scan's units.
@@ -1288,7 +1298,9 @@ impl DirectoryWalker {
             });
         }
 
+        let omitted = Arc::new(parking_lot::Mutex::new(Some(HashSet::new())));
         let windows = Arc::new(DirWindows {
+            omitted: Arc::clone(&omitted),
             size: self.dir_window,
             starts: oversized_window_starts().lock().clone(),
             reads: read_ahead::shared(),
@@ -1325,12 +1337,10 @@ impl DirectoryWalker {
 
         // Retain ready and deferred work so cancellation can report every
         // directory the workers never listed.
-        Ok(WalkStream::new(
-            result_rx,
-            Some(work),
-            unfinished,
-            Arc::clone(&self.cancel),
-        ))
+        let mut stream =
+            WalkStream::new(result_rx, Some(work), unfinished, Arc::clone(&self.cancel));
+        stream.omitted = omitted;
+        Ok(stream)
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -1461,6 +1471,7 @@ fn process_directory(
         .relation(dir_path, config.follow_symlinks)
     {
         ExclusionRelation::Excluded => {
+            windows.omit(dir_path);
             windows.reads.lock().forget(dir_path);
             return;
         }
@@ -1474,6 +1485,7 @@ fn process_directory(
     // Note: .sbh-protect marker files are detected during child iteration below,
     // avoiding a separate lstat per directory.
     if protection.read().is_protected(dir_path) {
+        windows.omit(dir_path);
         windows.reads.lock().forget(dir_path);
         return;
     }
@@ -1510,6 +1522,7 @@ fn process_directory(
         && let Some(ref meta) = dir_meta
         && device_id(meta) != root_dev
     {
+        windows.omit(dir_path);
         return;
     }
 
@@ -1696,6 +1709,7 @@ fn process_directory(
             // Detect .sbh-protect marker during iteration. If found,
             // register the marker and bail — no children get queued.
             ".sbh-protect" => {
+                windows.omit(dir_path);
                 protection.write().register_marker(dir_path);
                 windows.reads.lock().discard(dir_path, &read);
                 return; // Skip rest of directory — protected subtree.
@@ -1812,6 +1826,7 @@ fn process_directory(
         }
         match fs::symlink_metadata(dir_path.join(".sbh-protect")) {
             Ok(_) => {
+                windows.omit(dir_path);
                 protection.write().register_marker(dir_path);
                 windows.reads.lock().discard(dir_path, &read);
                 return;
@@ -1835,6 +1850,9 @@ fn process_directory(
     // window beyond fresh EOF also leaves the earlier names unvisited, even
     // when the shrunken directory now fits one window.
     let next_start = next_window_start(window_start, read.total_count, windows.size);
+    if depth >= config.max_depth && !read.children.is_empty() {
+        windows.omit(dir_path);
+    }
     if next_start.is_some() || read.entries_incomplete {
         // A window or failed child observation left part of this ground unseen.
         results.mark_unfinished(dir_path);
@@ -1990,7 +2008,7 @@ fn process_directory(
                 parent_has_node_manifest: read.parent_has_node_manifest,
             },
             config,
-            &windows.exclusions,
+            windows,
             results,
         ) {
             if retain_reads {
@@ -2103,7 +2121,7 @@ fn dispatch_turn(
                 parent_has_node_manifest: read.parent_has_node_manifest,
             },
             config,
-            &windows.exclusions,
+            windows,
             results,
         ) {
             completion.defer_to(&mut parent);
@@ -2191,11 +2209,12 @@ fn child_work_item(
     filesystem: WalkFilesystem,
     context: OpaqueTreeContext,
     config: &WalkerConfig,
-    exclusions: &WalkExclusions,
+    windows: &DirWindows,
     results: &ResultBatch<'_>,
 ) -> Option<WorkItem> {
-    let exclusion = exclusions.relation(&path, config.follow_symlinks);
+    let exclusion = windows.exclusions.relation(&path, config.follow_symlinks);
     if exclusion == ExclusionRelation::Excluded {
+        windows.omit(&path);
         return None;
     }
     let mut opaque_tree = config
@@ -2206,6 +2225,7 @@ fn child_work_item(
         .as_ref()
         .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::ProtectedOpaque)
     {
+        windows.omit(&path);
         return None;
     }
     if exclusion == ExclusionRelation::ContainsExcluded {
@@ -2221,6 +2241,7 @@ fn child_work_item(
             return None;
         };
         if !config.cross_devices && device_id(&meta) != root_device_id {
+            windows.omit(&path);
             return None;
         }
         Some(Box::new(meta))
@@ -2679,6 +2700,7 @@ fn oversized_window_starts() -> &'static parking_lot::Mutex<HashMap<PathBuf, u32
 
 /// Which entries of each directory listing a walk processes.
 struct DirWindows {
+    omitted: Arc<parking_lot::Mutex<Option<HashSet<PathBuf>>>>,
     /// Entries processed per directory per pass.
     size: u32,
     /// Window starts as of the walk's start, read without locking.
@@ -2691,6 +2713,20 @@ struct DirWindows {
     dispatch_cursor: Option<DispatchContext>,
     /// Root-mapped exclusions, renewed before this walk begins.
     exclusions: WalkExclusions,
+}
+
+impl DirWindows {
+    fn omit(&self, path: &Path) {
+        const MAX_OMISSIONS: usize = 16_384;
+        let mut state = self.omitted.lock();
+        if let Some(scopes) = state.as_mut() {
+            if scopes.len() >= MAX_OMISSIONS {
+                *state = None;
+            } else {
+                scopes.insert(path.to_owned());
+            }
+        }
+    }
 }
 
 /// Where the next pass's window starts, after a pass that processed
@@ -6086,6 +6122,7 @@ mod tests {
             // A one-entry batch sends on every push, so the emitter blocks.
             let mut results = ResultBatch::new(&result_tx, 1, &worker_unfinished);
             let windows = DirWindows {
+                omitted: Arc::default(),
                 size: MAX_ENTRIES_PER_DIR,
                 starts: HashMap::new(),
                 reads: Arc::default(),
@@ -6457,6 +6494,7 @@ mod tests {
         let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut results = ResultBatch::new(&tx, 1, &unfinished);
         let windows = DirWindows {
+            omitted: Arc::default(),
             size: MAX_ENTRIES_PER_DIR,
             starts: HashMap::new(),
             reads: Arc::default(),
