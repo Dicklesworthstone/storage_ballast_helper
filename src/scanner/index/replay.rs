@@ -96,7 +96,7 @@ fn revoke(record: &mut CandidateIndexRecord) -> bool {
 
 /// Best records compare smallest, so the heap exposes the worst retained
 /// record. A full sort and the bounded selection have exactly the same order.
-fn compare(a: &CandidateIndexRecord, b: &CandidateIndexRecord) -> Ordering {
+pub(super) fn compare(a: &CandidateIndexRecord, b: &CandidateIndexRecord) -> Ordering {
     b.score
         .unwrap_or(f64::NEG_INFINITY)
         .total_cmp(&a.score.unwrap_or(f64::NEG_INFINITY))
@@ -127,7 +127,7 @@ impl Ord for RankedRecord<'_> {
     }
 }
 
-fn eligible(record: &CandidateIndexRecord, generation: u64, now_nanos: u128) -> bool {
+pub(super) fn eligible(record: &CandidateIndexRecord, generation: u64, now_nanos: u128) -> bool {
     record.event_generation == generation
         // A zero-byte hint cannot contribute to the planner's byte objective.
         // Exclude it BEFORE the bounded heap: rejecting it only in the planner

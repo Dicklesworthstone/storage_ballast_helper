@@ -213,32 +213,48 @@ impl CandidateIndexRecord {
         let Some(identity) = score.identity else {
             return Ok(None);
         };
-        let metadata =
-            fs::symlink_metadata(&score.path).map_err(|e| SbhError::io(&score.path, e))?;
+        let Some(mut row) = Self::from_binding(&score.path, identity.into(), event_generation)?
+        else {
+            return Ok(None);
+        };
+        row.size_estimate_bytes = score.size_bytes;
+        row.prune_decision = IndexedPruneDecision::from_opaque_tree(opaque_tree);
+        row.score = Some(score.total_score);
+        row.safety_state = safety_state_from_score(score);
+        row.structural_signals = structural_signals;
+        Ok(Some(row))
+    }
+
+    fn from_binding(
+        path: &Path,
+        identity: IndexedIdentity,
+        event_generation: u64,
+    ) -> Result<Option<Self>> {
+        let metadata = fs::symlink_metadata(path).map_err(|e| SbhError::io(path, e))?;
         // Never attach a replacement's metadata to the old scanner identity.
         // The next walk may index the replacement with its own evidence.
-        if identity_from_metadata(&metadata) != IndexedIdentity::from(identity) {
+        if identity_from_metadata(&metadata) != identity {
             return Ok(None);
         }
-        let (parent_identity, parent_mtime_nanos) = parent_snapshot(&score.path);
+        let (parent_identity, parent_mtime_nanos) = parent_snapshot(path);
 
         Ok(Some(Self {
-            path: score.path.clone(),
-            identity: identity.into(),
+            path: path.to_owned(),
+            identity,
             parent_identity,
             parent_mtime_nanos,
             candidate_mtime_nanos: system_time_nanos(
                 metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             ),
-            candidate_ctime_nanos: ctime_for_path(&score.path).map(system_time_nanos),
-            size_estimate_bytes: score.size_bytes,
-            prune_decision: IndexedPruneDecision::from_opaque_tree(opaque_tree),
-            score: Some(score.total_score),
-            safety_state: safety_state_from_score(score),
+            candidate_ctime_nanos: ctime_for_path(path).map(system_time_nanos),
+            size_estimate_bytes: 0,
+            prune_decision: IndexedPruneDecision::None,
+            score: None,
+            safety_state: CandidateSafetyState::Unknown,
             fail_count: 0,
             cooldown_until_nanos: None,
             event_generation,
-            structural_signals,
+            structural_signals: StructuralSignals::default(),
         }))
     }
 
@@ -284,10 +300,34 @@ impl CandidateIndexRecord {
     /// candidate was dispatched again on the next.
     #[must_use]
     pub fn same_object(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.identity == other.identity
+        self.path == other.path && self.same_object_state(other)
+    }
+
+    fn same_object_state(&self, other: &Self) -> bool {
+        self.identity == other.identity
             && self.candidate_mtime_nanos == other.candidate_mtime_nanos
             && self.candidate_ctime_nanos == other.candidate_ctime_nanos
+    }
+
+    fn inherit_backoff(&mut self, existing: &Self) {
+        if self.same_object_state(existing) {
+            self.fail_count = existing.fail_count;
+            self.cooldown_until_nanos = existing.cooldown_until_nanos;
+            if existing.safety_state == CandidateSafetyState::Failed
+                && self.safety_state == CandidateSafetyState::Safe
+            {
+                self.safety_state = CandidateSafetyState::Failed;
+            }
+        }
+    }
+
+    fn alias_binding_current(&self) -> bool {
+        fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            identity_from_metadata(&metadata) == self.identity
+                && metadata.modified().ok().map(system_time_nanos)
+                    == Some(self.candidate_mtime_nanos)
+                && ctime_for_path(&self.path).map(system_time_nanos) == self.candidate_ctime_nanos
+        })
     }
 
     #[must_use]
@@ -428,7 +468,7 @@ impl ScannerCandidateIndex {
         if let Some(previous) = self.paths.get(&record.path).copied()
             && previous != record.identity
         {
-            self.records.remove(&previous);
+            self.forget_observation(&record.path, previous);
         }
         if let Some(existing) = self.records.get(&record.identity) {
             if existing.path != record.path {
@@ -441,17 +481,7 @@ impl ScannerCandidateIndex {
                     self.aliases.insert(existing.path.clone(), existing.clone());
                 }
             }
-            if existing.same_object(&record) {
-                record.fail_count = existing.fail_count;
-                record.cooldown_until_nanos = existing.cooldown_until_nanos;
-                // A failed attempt is retryable, not permission to overwrite
-                // a newly observed active-reference or safety veto with Failed.
-                if existing.safety_state == CandidateSafetyState::Failed
-                    && record.safety_state == CandidateSafetyState::Safe
-                {
-                    record.safety_state = CandidateSafetyState::Failed;
-                }
-            }
+            record.inherit_backoff(existing);
         }
         self.paths.insert(record.path.clone(), record.identity);
         self.records.insert(record.identity, record);
@@ -460,7 +490,7 @@ impl ScannerCandidateIndex {
     #[must_use]
     pub fn candidate_in_cooldown(&self, record: &CandidateIndexRecord, now: SystemTime) -> bool {
         self.records.get(&record.identity).is_some_and(|existing| {
-            existing.same_object(record) && self.in_cooldown(record.identity, now)
+            existing.same_object_state(record) && self.in_cooldown(record.identity, now)
         })
     }
 
@@ -515,16 +545,38 @@ impl ScannerCandidateIndex {
             .clone()
             .any(|row| row.vetoed)
             .then(|| rejected_scopes(evidence));
+        let now_nanos = system_time_nanos(now);
+        let admitted = |i: usize, row: &CandidateIndexRecord| {
+            denied.as_ref().is_none_or(|flags| !flags[i])
+                && within_scope(&row.path)
+                && replay::eligible(row, self.event_generation, now_nanos)
+        };
+        // A scoped pass may see only an alternate spelling. Keep one usable
+        // spelling per object and renew alternate bindings before nomination.
+        let mut alternate = BTreeMap::new();
+        for (i, alias) in self.aliases.values().enumerate() {
+            if admitted(i + self.records.len(), alias)
+                && !self.in_cooldown(alias.identity, now)
+                && alias.alias_binding_current()
+            {
+                alternate
+                    .entry(alias.identity)
+                    .and_modify(|best: &mut &CandidateIndexRecord| {
+                        if replay::compare(alias, best).is_lt() {
+                            *best = alias;
+                        }
+                    })
+                    .or_insert(alias);
+            }
+        }
         let eligible_scope = self.records.values().enumerate().filter_map(|(i, record)| {
-            (denied.as_ref().is_none_or(|flags| !flags[i]) && within_scope(&record.path))
-                .then_some(record)
+            if admitted(i, record) {
+                Some(record)
+            } else {
+                alternate.get(&record.identity).copied()
+            }
         });
-        replay::ranked_records(
-            eligible_scope,
-            self.event_generation,
-            system_time_nanos(now),
-            limit,
-        )
+        replay::ranked_records(eligible_scope, self.event_generation, now_nanos, limit)
     }
 
     /// Forget a record whose path is gone or now names another object. A
@@ -543,7 +595,24 @@ impl ScannerCandidateIndex {
     pub(crate) fn forget_observation(&mut self, path: &Path, identity: IndexedIdentity) {
         if self.paths.get(path) == Some(&identity) {
             self.paths.remove(path);
-            self.records.remove(&identity);
+            if let Some(previous) = self.records.remove(&identity) {
+                let next = self
+                    .aliases
+                    .values()
+                    .find(|alias| alias.identity == identity && alias.may_still_name_object())
+                    .map(|alias| alias.path.clone());
+                if let Some(mut promoted) = next.and_then(|key| self.aliases.remove(&key)) {
+                    promoted.inherit_backoff(&previous);
+                    if !promoted.alias_binding_current() {
+                        promoted.score = None;
+                        if !promoted.safety_state.is_veto() {
+                            promoted.safety_state = CandidateSafetyState::Unknown;
+                        }
+                    }
+                    self.paths.insert(promoted.path.clone(), identity);
+                    self.records.insert(identity, promoted);
+                }
+            }
         } else if self
             .aliases
             .get(path)
@@ -564,7 +633,16 @@ impl ScannerCandidateIndex {
                 .filter(|row| row.identity == identity)
         };
         if let Some(row) = row {
+            if !row.safety_state.is_veto() {
+                row.safety_state = CandidateSafetyState::Vetoed;
+            }
+        } else if let Ok(Some(mut row)) =
+            CandidateIndexRecord::from_binding(path, identity, self.event_generation)
+        {
+            // Protected or unrankable observations can be the only evidence
+            // keeping a later replay of their enclosing artifact safe.
             row.safety_state = CandidateSafetyState::Vetoed;
+            self.upsert(row);
         }
     }
 
@@ -582,6 +660,16 @@ impl ScannerCandidateIndex {
             .retain(|_, alias| alias.may_still_name_object());
         let alias_ids: std::collections::BTreeSet<_> =
             self.aliases.values().map(|alias| alias.identity).collect();
+        for id in &alias_ids {
+            if let Some(missing) = self
+                .records
+                .get(id)
+                .filter(|row| !row.may_still_name_object())
+            {
+                let old_path = missing.path.clone();
+                self.forget_observation(&old_path, *id);
+            }
+        }
         self.records.retain(|_, record| {
             // When a scoped change revoked an old veto, disappearance or
             // replacement is positive evidence that the old binding is gone.
@@ -958,6 +1046,72 @@ mod tests {
         assert_eq!(
             index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
             parent.path
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_replay_renews_alternate_names_deduplicates_and_keeps_backoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("A");
+        let link = tmp.path().join("B");
+        let a = original.join("target");
+        let b = link.join("target");
+        fs::create_dir_all(&a).unwrap();
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        let id = identity_from_metadata(&fs::symlink_metadata(&a).unwrap());
+        let observed = |path: &Path, rank| {
+            let mut row = CandidateIndexRecord::from_binding(path, id, 0)
+                .unwrap()
+                .unwrap();
+            row.score = Some(rank);
+            row.size_estimate_bytes = 100;
+            row.safety_state = CandidateSafetyState::Safe;
+            row
+        };
+        let mut index = ScannerCandidateIndex::new(context("scoped-alias"));
+        index.upsert(observed(&a, 0.8));
+        index.upsert(observed(&b, 0.9));
+        let scopes = [original.clone()];
+        assert_eq!(
+            index.ranked_records_within(&scopes, UNIX_EPOCH, 1)[0].path,
+            a
+        );
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 10).len(), 1);
+        index.record_failure(
+            id,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        assert!(
+            index
+                .ranked_records_within(&scopes, UNIX_EPOCH, 1)
+                .is_empty()
+        );
+        // The alternate was positively identified and rescored. Switching
+        // primary cannot shorten the retry backoff for the same object.
+        index.upsert(observed(&a, 0.8));
+        assert!(index.ranked_records(UNIX_EPOCH, 10).is_empty());
+        index.forget_observation(&a, id);
+        assert!(index.ranked_records(UNIX_EPOCH, 10).is_empty());
+        assert_eq!(
+            index.ranked_records(UNIX_EPOCH + Duration::from_secs(10), 10)[0].path,
+            b
+        );
+        assert!(
+            index
+                .ranked_records_within(&scopes, UNIX_EPOCH + Duration::from_secs(10), 1)
+                .is_empty()
+        );
+
+        index.upsert(observed(&a, 0.8));
+        fs::create_dir(b.join("new-child")).unwrap();
+        assert!(
+            index
+                .ranked_records_within(&[link], UNIX_EPOCH + Duration::from_secs(10), 1)
+                .is_empty(),
+            "stale alternate metadata requires a fresh walk"
         );
     }
 
