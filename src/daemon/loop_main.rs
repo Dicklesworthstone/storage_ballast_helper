@@ -13794,32 +13794,49 @@ impl ScanSafety {
         let Some(unfinished) = unfinished else { return };
         if unfinished.is_empty() && popped.is_none() {
             ready.extend(pending);
-        } else {
-            ready.extend(pending.into_iter().filter(|row| {
-                let isolated = self
-                    .isolated_roots
-                    .iter()
-                    .any(|root| row.path.starts_with(root));
-                unfinished
-                    .iter()
-                    .map(PathBuf::as_path)
-                    .chain(popped)
-                    .all(|gap| {
-                        if row.path.starts_with(gap) || gap.starts_with(&row.path) {
-                            return false;
-                        }
-                        isolated
-                            || self.isolated_roots.iter().any(|root| {
-                                gap.starts_with(root)
-                                    && self
-                                        .root_devices
-                                        .get(root)
-                                        .zip(row.identity)
-                                        .is_some_and(|(device, id)| *device != id.device_id)
-                            })
-                    })
-            }));
+            return;
         }
+
+        // Index once: a full scan may rank hundreds of thousands of rows
+        // alongside thousands of independent depth or protection boundaries.
+        let gaps: std::collections::BTreeSet<&Path> = unfinished
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(popped)
+            .collect();
+        let isolated: HashSet<&Path> = self.isolated_roots.iter().map(PathBuf::as_path).collect();
+        let mut every_gap_mapped = true;
+        let mut gap_devices = HashSet::new();
+        for gap in &gaps {
+            let mut devices = gap
+                .ancestors()
+                .filter(|root| isolated.contains(root))
+                .filter_map(|root| self.root_devices.get(root));
+            let Some(&device) = devices.next() else {
+                every_gap_mapped = false;
+                break;
+            };
+            // Cross-device proof needs a different isolated device for each
+            // gap. A gap mapped to multiple devices can satisfy any known ID.
+            if devices.all(|&other| other == device) {
+                gap_devices.insert(device);
+            }
+        }
+
+        ready.extend(pending.into_iter().filter(|row| {
+            let path = row.path.as_path();
+            let overlaps = path.ancestors().any(|ancestor| gaps.contains(ancestor))
+                || gaps
+                    .range(path..)
+                    .next()
+                    .is_some_and(|gap| gap.starts_with(path));
+            !overlaps
+                && (path.ancestors().any(|parent| isolated.contains(parent))
+                    || (every_gap_mapped
+                        && row
+                            .identity
+                            .is_some_and(|id| !gap_devices.contains(&id.device_id))))
+        }));
     }
 }
 
@@ -47935,6 +47952,104 @@ mod tests {
             ready[0].path, other_device.path,
             "another volume cannot contain its alias"
         );
+    }
+
+    #[test]
+    fn indexed_scan_gaps_match_pairwise_receipts_across_mixed_volumes() {
+        let path = PathBuf::from;
+        let mut safety = ScanSafety::default();
+        // The nested root exercises multiple distinct candidate devices for
+        // one gap. An isolated root without a device must convey no ID proof.
+        for (root, device) in [
+            ("/a", Some(1)),
+            ("/a/nested", Some(2)),
+            ("/b", Some(3)),
+            ("/other", None),
+        ] {
+            safety.isolated_roots.push(path(root));
+            if let Some(device) = device {
+                safety.root_devices.insert(path(root), device);
+            }
+        }
+        let mut candidates = Vec::new();
+        for name in [
+            "/",
+            "/a",
+            "/a/nested/leaf",
+            "/a/beside",
+            "/a2",
+            "/b/child",
+            "/other/sibling",
+            "/uncertain/row",
+        ] {
+            for device in [None, Some(1), Some(2), Some(3), Some(4)] {
+                let mut row = test_candidate(name, 0.8);
+                row.identity = device.map(|device_id| FsIdentity {
+                    device_id,
+                    inode: 1,
+                    kind: crate::scanner::walker::FsEntryKind::Directory,
+                });
+                candidates.push(row);
+            }
+        }
+        let gaps = [
+            "/a/nested",
+            "/a/beside/child",
+            "/b/child",
+            "/other/child",
+            "/unknown",
+            "/a/nested",
+        ];
+        for mask in 0..(1 << gaps.len()) {
+            let unfinished: Vec<_> = gaps
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, gap)| path(*gap))
+                .collect();
+            for popped in [
+                None,
+                Some(Path::new("/uncertain")),
+                Some(Path::new("/b/later")),
+            ] {
+                let expected: Vec<_> = candidates
+                    .iter()
+                    .filter(|row| {
+                        let isolated = safety
+                            .isolated_roots
+                            .iter()
+                            .any(|root| row.path.starts_with(root));
+                        unfinished
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .chain(popped)
+                            .all(|gap| {
+                                !row.path.starts_with(gap)
+                                    && !gap.starts_with(&row.path)
+                                    && (isolated
+                                        || safety.isolated_roots.iter().any(|root| {
+                                            gap.starts_with(root)
+                                                && safety
+                                                    .root_devices
+                                                    .get(root)
+                                                    .zip(row.identity)
+                                                    .is_some_and(|(dev, id)| *dev != id.device_id)
+                                        }))
+                            })
+                    })
+                    .map(|row| (&row.path, row.identity))
+                    .collect();
+                let mut actual = Vec::new();
+                safety.release_covered(&mut actual, candidates.clone(), Some(&unfinished), popped);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|row| (&row.path, row.identity))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
