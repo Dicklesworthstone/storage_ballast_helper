@@ -258,12 +258,19 @@ pub(super) fn read_under(root: &Path) -> Result<Vec<MappedRegion>> {
 /// Require new, complete evidence before admitting a mutation. This shares the
 /// scanner's sweep lock and failure backoff, never its cached successful result.
 pub(super) fn read_under_fresh(root: &Path) -> Result<Vec<MappedRegion>> {
+    read_under_roots_fresh(std::slice::from_ref(&root.to_path_buf()))
+}
+
+pub(super) fn read_under_roots_fresh(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
     let snapshot = CACHE
         .get_or_init(Cache::default)
         .obtain_fresh(Instant::now, || {
             collect(&Native, Path::new(PROC_ROOT), Limits::default())
         })?;
-    snapshot.under_roots(std::slice::from_ref(&root.to_path_buf()))
+    snapshot.under_roots(roots)
 }
 
 /// Reuse one coverage-checked snapshot for an entire scanner pass. A catalog

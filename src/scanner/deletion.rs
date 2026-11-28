@@ -1307,7 +1307,7 @@ impl DeletionExecutor {
                 .filter(|(index, _)| vetoes.get(*index) != Some(&true))
                 .map(|(_, candidate)| candidate.path.clone())
                 .collect::<Vec<_>>();
-            let (paths, complete) = self.platform.as_ref().map_or_else(
+            let descriptors = self.platform.as_ref().map_or_else(
                 || {
                     #[cfg(target_os = "linux")]
                     {
@@ -1321,6 +1321,12 @@ impl DeletionExecutor {
                 |platform| {
                     walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &roots)
                 },
+            );
+            let native = crate::platform::current();
+            let (paths, complete) = walker::mutation_reference_paths(
+                self.platform.as_deref().unwrap_or(&native),
+                &roots,
+                descriptors,
             );
 
             if !complete {
@@ -7698,6 +7704,95 @@ mod tests {
         );
         assert!(second.exists());
         drop(handle);
+    }
+
+    #[test]
+    fn execution_keeps_mapped_and_executing_subtrees_without_open_descriptors() {
+        use crate::platform::types::{MappedRegion, ProcessInfo};
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch_dir();
+            let image = dir.path().join("image-cache");
+            let mapped = dir.path().join("mapped-cache");
+            let idle = dir.path().join("idle-cache");
+            for root in [&image, &mapped, &idle] {
+                fs::create_dir_all(root.join("objects")).unwrap();
+                fs::write(root.join("objects/data.bin"), b"bytes").unwrap();
+            }
+            let platform = crate::platform::pal::MockPlatform::healthy()
+                .with_executable(ProcessInfo {
+                    pid: 42,
+                    parent_pid: None,
+                    name: "worker".into(),
+                    command_line: vec![],
+                    executable: Some(image.join("objects/data.bin")),
+                    cwd: None,
+                    start_time_unix_ms: None,
+                    virtual_memory_bytes: None,
+                    resident_memory_bytes: None,
+                    cpu_user_micros: None,
+                    cpu_system_micros: None,
+                })
+                .with_mmap_region(MappedRegion {
+                    pid: 43,
+                    path: mapped.join("objects/data.bin"),
+                    start_address: None,
+                    end_address: None,
+                    protection: None,
+                });
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: true,
+                    mode,
+                    quarantine_roots: vec![dir.path().to_owned()],
+                    ..offline_config()
+                },
+                None,
+            )
+            .with_platform(Arc::new(platform));
+            let plan = executor.plan(
+                [&image, &mapped, &idle]
+                    .map(|path| make_identity_candidate(path, 5, 0.95))
+                    .into(),
+            );
+            let report = executor.execute(&plan, None);
+            assert_eq!(
+                report.skipped_by_reason.get("file_open"),
+                Some(&2),
+                "{report:?}"
+            );
+            assert_eq!(report.items_deleted, 1, "{report:?}");
+            assert!(image.join("objects/data.bin").is_file());
+            assert!(mapped.join("objects/data.bin").is_file());
+            assert!(!idle.exists());
+        }
+    }
+
+    #[test]
+    fn incomplete_executable_coverage_preserves_unreferenced_candidates() {
+        let dir = scratch_dir();
+        let root = dir.path().join("target");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("artifact"), b"build").unwrap();
+        let platform =
+            crate::platform::pal::MockPlatform::healthy().with_executables_complete(false);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                ..offline_config()
+            },
+            None,
+        )
+        .with_platform(Arc::new(platform));
+        let plan = executor.plan(vec![make_identity_candidate(&root, 5, 0.95)]);
+        let report = executor.execute(&plan, None);
+        assert_eq!(
+            report.skipped_by_reason.get("open_scan_incomplete"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(report.items_failed, 0);
+        assert!(root.join("artifact").is_file());
     }
 
     #[test]

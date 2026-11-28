@@ -587,6 +587,51 @@ fn assert_no_descriptor_for_inode(pid: u32, expected: &fs::Metadata) {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cleanup_preserves_a_live_mapping_after_the_last_descriptor_closes() {
+    use std::io::Write as _;
+    use storage_ballast_helper::scanner::walker::identity_for_path;
+
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let artifact = fixture.path().join("target");
+    fs::create_dir(&artifact).unwrap();
+    let data = artifact.join("build-output");
+    fs::write(&data, [0x5a; 16_384]).unwrap();
+    let ready = fixture.path().join("ready");
+    let verified = fixture.path().join("verified");
+    let Some(child) = spawn_deleted_open_mapping_holder(&data, &ready, &verified) else {
+        return;
+    };
+    let mut child = ChildGuard::new(child);
+    wait_for_file(&ready, Duration::from_secs(30), || {
+        assert!(child.child.try_wait().unwrap().is_none());
+    });
+    assert_no_descriptor_for_inode(child.child.id(), &fs::metadata(&data).unwrap());
+
+    let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+    let mut candidate = e2e_scored_candidate(DecisionAction::Delete, 0.95);
+    candidate.path = artifact.clone();
+    candidate.identity = Some(identity_for_path(&artifact, false).unwrap());
+    let plan = executor.plan(vec![candidate]);
+    let report = executor.execute(&plan, None);
+    assert_eq!(report.items_deleted, 0, "{report:?}");
+    // Restricted procfs can prevent a complete host scan. Both legitimate
+    // outcomes preserve the file, and no unrelated skip may pass the fixture.
+    assert!(
+        ["file_open", "open_scan_incomplete"]
+            .iter()
+            .any(|reason| report.skipped_by_reason.get(*reason) == Some(&1)),
+        "{report:?}"
+    );
+    assert!(data.is_file());
+    child.child.stdin.as_mut().unwrap().write_all(b"v").unwrap();
+    wait_for_file(&verified, Duration::from_secs(30), || {
+        assert!(child.child.try_wait().unwrap().is_none());
+    });
+    assert_eq!(fs::read_to_string(verified).unwrap(), "unchanged");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[allow(clippy::too_many_lines)]
 fn deleted_open_blame_reports_an_unlinked_mapping_without_descriptors() {
     use std::io::Write as _;

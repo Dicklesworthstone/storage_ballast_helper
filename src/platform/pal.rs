@@ -597,6 +597,16 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "mmap_regions_under_fresh")
     }
 
+    /// Fresh mutation evidence for an entire batch. Native whole-host probes
+    /// override this to inspect the process table once for all candidate roots.
+    fn mmap_regions_under_roots_fresh(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        let mut regions = Vec::new();
+        for root in roots {
+            regions.extend(self.mmap_regions_under_fresh(root)?);
+        }
+        Ok(regions)
+    }
+
     /// Return mapped-file evidence under any candidate root. Platforms with a
     /// host-wide process sweep should override this to scan once per pass.
     /// Partial or inaccessible coverage is an error, not negative evidence.

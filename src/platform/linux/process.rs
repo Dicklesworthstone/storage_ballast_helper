@@ -321,6 +321,10 @@ pub(super) fn read_mmap_regions_under_fresh(root: &Path) -> Result<Vec<MappedReg
     mmap_scan::read_under_fresh(root)
 }
 
+pub(super) fn read_mmap_regions_under_roots_fresh(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+    mmap_scan::read_under_roots_fresh(roots)
+}
+
 /// Inspect the mapped regions once for the complete candidate-root set.
 pub(super) fn read_mmap_regions_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
     mmap_scan::read_under_roots(roots)

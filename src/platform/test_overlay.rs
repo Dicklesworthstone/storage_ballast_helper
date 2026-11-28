@@ -465,6 +465,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.mmap_regions_under_fresh(path)
     }
 
+    fn mmap_regions_under_roots_fresh(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        self.inner.mmap_regions_under_roots_fresh(roots)
+    }
+
     fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
         self.inner.mmap_regions_under_roots(roots)
     }

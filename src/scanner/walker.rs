@@ -2383,7 +2383,7 @@ fn is_object_name(name: &std::ffi::OsStr) -> bool {
         })
 }
 
-fn signals_from_children(
+pub(crate) fn signals_from_children(
     child_names: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
     path: &Path,
 ) -> StructuralSignals {
@@ -2893,6 +2893,58 @@ pub(crate) fn open_path_ancestors_for_roots(
         add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
     }
     ancestors
+}
+
+/// File descriptors, executable images, and memory mappings have different
+/// lifetimes. A process can close its last descriptor and keep using the
+/// bytes. Refresh executable and mapping evidence for the remaining mutation
+/// candidates; positive directory references already protect their scope.
+pub(crate) fn mutation_reference_paths(
+    platform: &dyn crate::platform::pal::Platform,
+    roots: &[PathBuf],
+    (mut paths, complete): (HashSet<PathBuf>, bool),
+) -> (HashSet<PathBuf>, bool) {
+    if !complete {
+        return (paths, false);
+    }
+    let mut unchecked: Vec<_> = roots
+        .iter()
+        .filter(|root| !is_path_open_by_ancestor(root, &paths))
+        .cloned()
+        .collect();
+    if unchecked.is_empty() {
+        return (paths, true);
+    }
+
+    let normalized = normalized_open_roots(&unchecked);
+    let Ok(images) = platform.executables_under_roots(&unchecked) else {
+        return (paths, false);
+    };
+    for process in images.processes {
+        let Some(image) = process.executable.filter(|path| path.is_absolute()) else {
+            return (paths, false);
+        };
+        add_open_path_ancestor_chain(&mut paths, &image, &normalized);
+    }
+    if !images.complete {
+        return (paths, false);
+    }
+    unchecked.retain(|root| !is_path_open_by_ancestor(root, &paths));
+    if unchecked.is_empty() {
+        return (paths, true);
+    }
+    let Ok(regions) = platform.mmap_regions_under_roots_fresh(&unchecked) else {
+        return (paths, false);
+    };
+    // One shared library can occur in thousands of regions across processes.
+    let files: HashSet<_> = regions.into_iter().map(|region| region.path).collect();
+    for file in files {
+        if !file.is_absolute() {
+            return (paths, false);
+        }
+        add_open_path_ancestor_chain(&mut paths, &file, &normalized);
+    }
+    (paths, true)
 }
 
 /// Refresh build declarations independently of a reusable descriptor snapshot.

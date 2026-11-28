@@ -328,6 +328,10 @@ impl Platform for MacOsPal {
             .map_err(|error| macos_method_error("mmap_regions_under_roots", &error))
     }
 
+    fn mmap_regions_under_roots_fresh(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        self.mmap_regions_under_roots(roots)
+    }
+
     fn self_stats(&self) -> Result<SelfStats> {
         let usage = sys::current_mach_task_usage()
             .map_err(|error| macos_method_error("self_stats", &error))?;
