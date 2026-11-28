@@ -280,18 +280,17 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
-        // An idle baseline has no ordinary consumption rate. Its positive-only
-        // median can consist entirely of a brief allocation, and the sticky
-        // EWMA can keep projecting imminent exhaustion after that writer has
-        // stopped or returned to light background writes. The latest measured
-        // rate supplies a conservative runway floor for this idle baseline.
+        // Freeing space can dominate the absolute movement median, and the
+        // positive-only median can consist entirely of a brief allocation.
+        // Bound uncorroborated urgency by the faster of ordinary consumption
+        // and the current interval once a burst slows or stops.
         // A currently consuming fast writer retains immediate rescue, and a
         // confirmed elapsed-time net drain has already taken the stronger
         // evidence path above, even during a short idle or freeing interval.
         // Do not change the immediate PID forecast.
         let bs = &estimate.burst_state;
         let minutes_remaining =
-            (estimate.seconds_to_exhaustion / 60.0).max(idle_baseline_runway_floor(estimate));
+            (estimate.seconds_to_exhaustion / 60.0).max(measured_runway_floor(estimate));
 
         // A percentage is not a time budget: a small volume can be mostly
         // empty and still fill within minutes at its ordinary historical rate.
@@ -320,8 +319,7 @@ impl PredictiveActionPolicy {
             }
 
             // Take the more conservative (longer) estimate.
-            let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
-            let minutes_remaining = ewma_minutes.max(median_minutes);
+            let minutes_remaining = minutes_remaining.max(median_minutes);
 
             if !minutes_remaining.is_finite() || minutes_remaining < 0.0 {
                 return PredictiveAction::Clear;
@@ -565,8 +563,7 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
         return None;
     }
     let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
-    let median_minutes =
-        consumption_runway_minutes(estimate).max(idle_baseline_runway_floor(estimate));
+    let median_minutes = consumption_runway_minutes(estimate).max(measured_runway_floor(estimate));
     // Check both before max: f64::max deliberately ignores one NaN operand.
     if !ewma_minutes.is_finite()
         || ewma_minutes < 0.0
@@ -579,19 +576,27 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
     (conservative_minutes <= horizon_minutes).then_some(conservative_minutes)
 }
 
-/// A lower bound on unconfirmed runway when the robust baseline is idle.
-/// The positive-only median can contain only the recent burst; its rate must
-/// not exceed what the latest interval actually consumed. Missing evidence
-/// adds no constraint, and a stopped writer has no finite measured runway.
-fn idle_baseline_runway_floor(estimate: &RateEstimate) -> f64 {
+/// When neither the latest drain nor normal consumption supports an EWMA
+/// spike, even the faster measured rate is a lower bound on its runway.
+/// A currently rapid writer can still qualify for immediate rescue, and a
+/// steadily draining filesystem can tolerate an occasional idle sample.
+fn measured_runway_floor(estimate: &RateEstimate) -> f64 {
     let burst = &estimate.burst_state;
-    if !burst.calibrated || burst.median_rate != 0.0 {
+    if !burst.calibrated {
         return 0.0;
     }
     let Some(rate) = burst.latest_rate else {
         return 0.0;
     };
-    if !rate.is_finite() || rate <= 0.0 {
+    let rate = rate.max(burst.median_drain_rate);
+    // Preserve conformal early warning for ordinary consumption. A shorter
+    // corrected horizon alone does not mean an EWMA was inflated by churn.
+    if burst.median_drain_rate > 0.0
+        && (burst.median_drain_rate >= burst.median_rate || estimate.bytes_per_second <= rate)
+    {
+        return 0.0;
+    }
+    if rate <= 0.0 {
         return f64::INFINITY;
     }
     estimate.free_bytes as f64 / rate / 60.0
@@ -649,7 +654,9 @@ fn valid_prediction_evidence(estimate: &RateEstimate, current_free_pct: f64) -> 
         && (!burst.calibrated
             || ((0.0..=1.0).contains(&burst.burst_probability)
                 && burst.median_rate.is_finite()
-                && burst.median_rate >= 0.0))
+                && burst.median_rate >= 0.0
+                && burst.median_drain_rate.is_finite()
+                && burst.median_drain_rate >= 0.0))
 }
 
 /// Linear interpolation between two values.

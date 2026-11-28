@@ -241,6 +241,67 @@ fn estimator_after_idle_burst() -> (DiskRateEstimator, Instant, u64) {
 }
 
 #[test]
+fn releases_do_not_back_a_rescue_after_a_short_writer_returns_to_background() {
+    let mib = 1_u64 << 20;
+    for (release_ticks, slow_ticks, typical_mib) in [(60, 25, 0), (40, 45, 1)] {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let mut free = 4000 * mib;
+        estimator.update(free, start, 0);
+        let mut tick = 0;
+        // Interleave enough large frees and a brief burst for the median
+        // absolute movement to be large in both traces. The second trace
+        // has a consuming majority, but its typical write rate is low.
+        for (ticks, change) in [(release_ticks, 100_i64), (slow_ticks, -1), (10, -100)] {
+            for interval in 1..=ticks {
+                tick += 1;
+                free = free.checked_add_signed(change * (1_i64 << 20)).unwrap();
+                let estimate = estimator.update(free, start + Duration::from_secs(tick), 0);
+                if change == -100 && interval == ticks {
+                    assert!(
+                        policy()
+                            .evaluate(&estimate, 9.0, PathBuf::from("/data"))
+                            .should_release_ballast(),
+                        "the active rapid writer still needs rescue: {estimate:?}"
+                    );
+                }
+            }
+        }
+        free -= mib;
+        let estimate = estimator.update(free, start + Duration::from_secs(tick + 1), 0);
+        assert!(estimate.forecast_rate_bytes_per_second.is_none());
+        assert!(estimate.seconds_to_exhaustion < 300.0);
+        assert_eq!(estimate.burst_state.median_rate, (100 * mib) as f64);
+        assert_eq!(
+            estimate.burst_state.median_drain_rate,
+            (typical_mib * mib) as f64
+        );
+        assert!(free / mib > 3600);
+        assert_eq!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "{estimate:?}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_consumption_retains_its_conformal_early_action() {
+    let mut estimate = forecast(0.0, 0.3, 1000.0);
+    estimate.free_bytes = 45 * 60 * 1000;
+    estimate.seconds_to_exhaustion = 20.0 * 60.0;
+    estimate.burst_state.median_drain_rate = 1000.0;
+    estimate.burst_state.latest_rate = Some(1000.0);
+    assert!(matches!(
+        policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+        PredictiveAction::PreemptiveCleanup {
+            minutes_remaining: 20.0,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn transient_writer_after_idle_does_not_corroborate_its_residual_forecast() {
     for tail_bytes_per_interval in [0_u64, 4096] {
         let (mut estimator, start, mut free) = estimator_after_idle_burst();

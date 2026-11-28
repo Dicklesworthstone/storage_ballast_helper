@@ -37,6 +37,9 @@ pub struct BurstState {
     /// Unlike `median_rate` (over absolute rates), intervals that freed space
     /// do not count as consumption (#29).
     pub median_consumption_rate: f64,
+    /// Median bytes consumed per observed interval, expressed as a rate.
+    /// Idle and freeing intervals contribute zero to this baseline.
+    pub median_drain_rate: f64,
     /// Signed rate of the latest observed interval, when calibrated. Unlike
     /// the EWMA or the positive-only median, this records whether consumption
     /// actually continued after a burst. `None` means no measured evidence.
@@ -53,6 +56,7 @@ impl Default for BurstState {
             mad_rate: 0.0,
             robust_upper_bound: f64::INFINITY,
             median_consumption_rate: 0.0,
+            median_drain_rate: 0.0,
             latest_rate: None,
         }
     }
@@ -664,6 +668,7 @@ impl DiskRateEstimator {
         let burst_probability =
             (deviation_factor * combined_weight / (deviation_factor + 1.0)).clamp(0.0, 1.0);
 
+        let (median_consumption_rate, median_drain_rate) = consumption_medians(&self.rate_history);
         BurstState {
             burst_probability,
             median_rate,
@@ -671,25 +676,29 @@ impl DiskRateEstimator {
             calibrated,
             mad_rate,
             robust_upper_bound,
-            median_consumption_rate: median_of_positive(&self.rate_history),
+            median_consumption_rate,
+            median_drain_rate,
             latest_rate: Some(latest_rate),
         }
     }
 }
 
-/// Median of the positive values; 0 when there are none.
-fn median_of_positive(rates: &VecDeque<f64>) -> f64 {
+/// Rates during writes alone and across all intervals, respectively.
+/// Both medians use the same sorted observations.
+fn consumption_medians(rates: &VecDeque<f64>) -> (f64, f64) {
     let mut consuming: Vec<f64> = rates.iter().copied().filter(|rate| *rate > 0.0).collect();
     if consuming.is_empty() {
-        return 0.0;
+        return (0.0, 0.0);
     }
     consuming.sort_by(f64::total_cmp);
-    let mid = consuming.len() / 2;
-    if consuming.len().is_multiple_of(2) {
-        f64::midpoint(consuming[mid - 1], consuming[mid])
-    } else {
-        consuming[mid]
-    }
+    let writing = f64::midpoint(
+        consuming[(consuming.len() - 1) / 2],
+        consuming[consuming.len() / 2],
+    );
+    let idle_or_freeing = rates.len() - consuming.len();
+    let drain_at = |i: usize| i.checked_sub(idle_or_freeing).map_or(0.0, |j| consuming[j]);
+    let typical = f64::midpoint(drain_at((rates.len() - 1) / 2), drain_at(rates.len() / 2));
+    (writing, typical)
 }
 
 #[inline]
@@ -733,7 +742,7 @@ fn project_time(rate: f64, distance_bytes: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskRateEstimator, Trend, VecDeque, median_of_positive};
+    use super::{DiskRateEstimator, Trend, VecDeque, consumption_medians};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -741,9 +750,13 @@ mod tests {
         // #29: the absolute median of this history is 1,000 B/s, but only two
         // intervals consumed space.
         let rates: VecDeque<f64> = [-1000.0, -1000.0, -1000.0, 10.0, 20.0].into();
-        assert!((median_of_positive(&rates) - 15.0).abs() < f64::EPSILON);
-        assert!(median_of_positive(&[-5.0, 0.0].into()).abs() < f64::EPSILON);
-        assert!((median_of_positive(&[3.0, 1.0, 2.0].into()) - 2.0).abs() < f64::EPSILON);
+        assert_eq!(consumption_medians(&rates), (15.0, 0.0));
+        assert_eq!(consumption_medians(&[-5.0, 0.0].into()), (0.0, 0.0));
+        assert_eq!(consumption_medians(&[3.0, 1.0, 2.0].into()), (2.0, 2.0));
+        assert_eq!(
+            consumption_medians(&[-5.0, 0.0, 10.0, 20.0].into()),
+            (15.0, 5.0)
+        );
     }
 
     #[test]
