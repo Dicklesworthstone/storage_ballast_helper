@@ -37,6 +37,12 @@ struct Checkpoint {
     event_generation: u64,
     #[serde(deserialize_with = "read_records")]
     records: Vec<CandidateIndexRecord>,
+    #[serde(
+        default,
+        deserialize_with = "read_records",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    aliases: Vec<CandidateIndexRecord>,
     integrity_hash: [u8; 32],
 }
 
@@ -72,9 +78,9 @@ fn read_records<'de, D: Deserializer<'de>>(
     deserializer.deserialize_seq(RecordsVisitor)
 }
 
-struct OrderedRecords<'a>(&'a BTreeMap<IndexedIdentity, CandidateIndexRecord>);
+struct OrderedRecords<'a, K>(&'a BTreeMap<K, CandidateIndexRecord>);
 
-impl Serialize for OrderedRecords<'_> {
+impl<K> Serialize for OrderedRecords<'_, K> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for record in self.0.values() {
@@ -89,7 +95,9 @@ struct CheckpointView<'a> {
     version: u32,
     context: &'a ScannerIndexContext,
     event_generation: u64,
-    records: OrderedRecords<'a>,
+    records: OrderedRecords<'a, IndexedIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aliases: Option<OrderedRecords<'a, PathBuf>>,
     integrity_hash: [u8; 32],
 }
 
@@ -290,16 +298,27 @@ fn save_with(
     limit: u64,
     before_publish: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    if index.records.len() > MAX_CHECKPOINT_RECORDS {
+    if index.records.len().saturating_add(index.aliases.len()) > MAX_CHECKPOINT_RECORDS {
         return Err(invalid("scanner checkpoint record limit exceeded"));
     }
     let records = OrderedRecords(&index.records);
-    let integrity_hash = integrity_hash(&index.context, index.event_generation, &records, limit)?;
+    let aliases = (!index.aliases.is_empty()).then(|| OrderedRecords(&index.aliases));
+    let integrity_hash = if let Some(aliases) = &aliases {
+        integrity_hash(
+            &index.context,
+            index.event_generation,
+            &(&records, aliases),
+            limit,
+        )?
+    } else {
+        integrity_hash(&index.context, index.event_generation, &records, limit)?
+    };
     let checkpoint = CheckpointView {
         version: CHECKPOINT_VERSION,
         context: &index.context,
         event_generation: index.event_generation,
         records,
+        aliases,
         integrity_hash,
     };
     let parent = path
@@ -391,12 +410,29 @@ fn load_with_limit(
             "root or scanner config fingerprint changed".to_string(),
         ));
     }
-    let computed = integrity_hash(
-        &checkpoint.context,
-        checkpoint.event_generation,
-        &checkpoint.records,
-        limit,
-    )
+    if checkpoint
+        .records
+        .len()
+        .saturating_add(checkpoint.aliases.len())
+        > MAX_CHECKPOINT_RECORDS
+    {
+        return Err(corrupt(invalid("scanner checkpoint record limit exceeded")));
+    }
+    let computed = if checkpoint.aliases.is_empty() {
+        integrity_hash(
+            &checkpoint.context,
+            checkpoint.event_generation,
+            &checkpoint.records,
+            limit,
+        )
+    } else {
+        integrity_hash(
+            &checkpoint.context,
+            checkpoint.event_generation,
+            &(&checkpoint.records, &checkpoint.aliases),
+            limit,
+        )
+    }
     .map_err(corrupt)?;
     if computed != checkpoint.integrity_hash {
         return Err(corrupt(invalid("integrity hash mismatch")));
@@ -428,11 +464,21 @@ fn load_with_limit(
             }
         }
     }
+    let mut aliases = BTreeMap::new();
+    for alias in checkpoint.aliases {
+        if alias.event_generation > checkpoint.event_generation
+            || paths.contains_key(&alias.path)
+            || aliases.insert(alias.path.clone(), alias).is_some()
+        {
+            return Err(corrupt(invalid("invalid scanner checkpoint alias")));
+        }
+    }
     Ok(ScannerCandidateIndex {
         context: checkpoint.context,
         event_generation: checkpoint.event_generation,
         records,
         paths,
+        aliases,
     })
 }
 
@@ -485,12 +531,26 @@ mod tests {
             context: index.context.clone(),
             event_generation: index.event_generation,
             records,
+            aliases: Vec::new(),
             integrity_hash: hash.finalize().into(),
         }
     }
 
     #[test]
-    fn streaming_bytes_match_v2_and_preserve_failure_cooldowns_after_restart() {
+    fn checkpoint_without_alias_evidence_requires_rediscovery_even_with_valid_v2_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.json");
+        let index = fixture("old");
+        let mut old = legacy(&index);
+        old.version = 2;
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let (loaded, status) = load(&path, index.context.clone());
+        assert!(matches!(status, ScannerIndexLoadStatus::Stale(_)));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn streaming_bytes_match_independent_encoder_and_preserve_failure_cooldowns_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("checkpoint.json");
         let mut index = fixture("original");

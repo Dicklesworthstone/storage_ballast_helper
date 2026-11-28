@@ -30,9 +30,9 @@ use crate::scanner::walker::{FsEntryKind, FsIdentity};
 mod checkpoint;
 mod replay;
 
-/// Bumped to 2 when records gained `structural_signals`; a version-1
-/// checkpoint is rejected and the next pass walks the roots once.
-const CHECKPOINT_VERSION: u32 = 2;
+/// Older checkpoints could discard an alias's veto or encode a suspended
+/// category as safe. Rediscover once before trusting their replay hints.
+const CHECKPOINT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum IndexedEntryKind {
@@ -377,6 +377,9 @@ pub struct ScannerCandidateIndex {
     /// its old inode's replay hint rather than leave both in the ranked queue.
     /// Derived from records on load, never independently persisted.
     paths: BTreeMap<PathBuf, IndexedIdentity>,
+    /// Other observed spellings contribute evidence, never another ranked
+    /// replay slot for the same identity.
+    aliases: BTreeMap<PathBuf, CandidateIndexRecord>,
 }
 
 impl ScannerCandidateIndex {
@@ -387,6 +390,7 @@ impl ScannerCandidateIndex {
             event_generation: 0,
             records: BTreeMap::new(),
             paths: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -417,6 +421,7 @@ impl ScannerCandidateIndex {
 
     pub fn upsert(&mut self, mut record: CandidateIndexRecord) {
         record.event_generation = self.event_generation;
+        self.aliases.remove(&record.path);
         // A fresh observation of this path supersedes every earlier identity
         // at that path, even when the new candidate is vetoed or has no score.
         // Otherwise an obsolete high score can monopolize a bounded replay.
@@ -430,6 +435,11 @@ impl ScannerCandidateIndex {
                 // Rename or a newly observed alias of the same identity:
                 // reusing its old path later must not retire this new binding.
                 self.paths.remove(&existing.path);
+                // A rename retires the old spelling. A live alias still
+                // connects its descendants and direct veto to this object.
+                if existing.may_still_name_object() {
+                    self.aliases.insert(existing.path.clone(), existing.clone());
+                }
             }
             if existing.same_object(&record) {
                 record.fail_count = existing.fail_count;
@@ -485,6 +495,7 @@ impl ScannerCandidateIndex {
     ) -> impl Iterator<Item = SafetyObservation<'_>> + Clone {
         self.records
             .values()
+            .chain(self.aliases.values())
             .map(CandidateIndexRecord::safety_observation)
     }
 
@@ -524,6 +535,37 @@ impl ScannerCandidateIndex {
         {
             self.paths.remove(&record.path);
         }
+        self.aliases.retain(|_, alias| alias.identity != identity);
+    }
+
+    /// Missing or replaced at this spelling. Other observed bindings still
+    /// contribute their own safety evidence.
+    pub(crate) fn forget_observation(&mut self, path: &Path, identity: IndexedIdentity) {
+        if self.paths.get(path) == Some(&identity) {
+            self.paths.remove(path);
+            self.records.remove(&identity);
+        } else if self
+            .aliases
+            .get(path)
+            .is_some_and(|record| record.identity == identity)
+        {
+            self.aliases.remove(path);
+        }
+    }
+
+    /// A fresh replay can discover a veto after the shortlist was built.
+    /// Record the direct refusal separately from retry backoff.
+    pub(crate) fn mark_observed_veto(&mut self, path: &Path, identity: IndexedIdentity) {
+        let row = if self.paths.get(path) == Some(&identity) {
+            self.records.get_mut(&identity)
+        } else {
+            self.aliases
+                .get_mut(path)
+                .filter(|row| row.identity == identity)
+        };
+        if let Some(row) = row {
+            row.safety_state = CandidateSafetyState::Vetoed;
+        }
     }
 
     /// Drop records that can neither be replayed nor hold a candidate back:
@@ -536,9 +578,19 @@ impl ScannerCandidateIndex {
         let now_nanos = system_time_nanos(now);
         let generation = self.event_generation;
         let before = self.records.len();
+        self.aliases
+            .retain(|_, alias| alias.may_still_name_object());
+        let alias_ids: std::collections::BTreeSet<_> =
+            self.aliases.values().map(|alias| alias.identity).collect();
         self.records.retain(|_, record| {
+            // When a scoped change revoked an old veto, disappearance or
+            // replacement is positive evidence that the old binding is gone.
+            if record.score.is_none() && record.safety_state.is_veto() {
+                return record.may_still_name_object();
+            }
             record.event_generation == generation
-                || (record.safety_state.is_veto() && record.may_still_name_object())
+                || ((record.safety_state.is_veto() || alias_ids.contains(&record.identity))
+                    && record.may_still_name_object())
                 || record
                     .cooldown_until_nanos
                     .is_some_and(|until| now_nanos < until)
@@ -573,6 +625,7 @@ impl ScannerCandidateIndex {
             // apparently fresh. Reset only after revoking all old records.
             self.records.clear();
             self.paths.clear();
+            self.aliases.clear();
             self.event_generation = 0;
         }
     }
@@ -817,6 +870,95 @@ mod tests {
                 summary: "test".to_string(),
             },
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replay_keeps_vetoes_across_live_aliases_restarts_and_scoped_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("original");
+        let mirror = tmp.path().join("mirror");
+        let target = real.join("target");
+        let hold = target.join("hold");
+        let clear = target.join("clear");
+        fs::create_dir_all(&hold).unwrap();
+        fs::create_dir(&clear).unwrap();
+        std::os::unix::fs::symlink(&real, &mirror).unwrap();
+        let fixture = |path: &Path, score_value, safety_state| {
+            let id = identity_from_metadata(&fs::symlink_metadata(path).unwrap());
+            let mut row = record(id, identity(99));
+            row.path = path.to_path_buf();
+            row.score = score_value;
+            row.safety_state = safety_state;
+            row
+        };
+        let mut index = ScannerCandidateIndex::new(context("alias"));
+        let alias_target = mirror.join("target");
+        let roots = [alias_target.clone()];
+        let old_parent = fixture(&target, Some(0.2), CandidateSafetyState::Safe);
+        let parent = fixture(&alias_target, Some(1.0), CandidateSafetyState::Safe);
+        let child = fixture(&hold, None, CandidateSafetyState::ActiveReference);
+        let sibling = fixture(
+            &alias_target.join("clear"),
+            Some(0.4),
+            CandidateSafetyState::Safe,
+        );
+        for row in [&old_parent, &parent, &child, &sibling] {
+            index.upsert(row.clone());
+        }
+        let checkpoint = tmp.path().join("index.json");
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (mut index, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1),
+            vec![sibling.clone()]
+        );
+        index.invalidate_paths([hold.as_path()]);
+        assert_eq!(index.get(parent.identity).unwrap().score, None);
+        index.mark_event_overflow();
+        index.evict_stale(UNIX_EPOCH);
+        index.upsert(parent.clone());
+        index.upsert(sibling.clone());
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
+            sibling.path
+        );
+
+        // A reliable rescore at the original veto path releases the parent.
+        let mut resumed = child.clone();
+        resumed.safety_state = CandidateSafetyState::Safe;
+        resumed.score = Some(0.1);
+        index.upsert(resumed);
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
+            parent.path
+        );
+
+        // The same inode can have different path-specific vetoes. Seeing it
+        // safely through another spelling must not undo a refusal at hold.
+        index.mark_observed_veto(&child.path, child.identity);
+        let alias_child = fixture(
+            &alias_target.join("hold"),
+            Some(0.95),
+            CandidateSafetyState::Safe,
+        );
+        index.upsert(alias_child.clone());
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
+            sibling.path
+        );
+        index.forget_observation(&alias_child.path, alias_child.identity);
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
+            sibling.path
+        );
+        index.forget_observation(&child.path, child.identity);
+        assert_eq!(
+            index.ranked_records_within(&roots, UNIX_EPOCH, 1)[0].path,
+            parent.path
+        );
     }
 
     #[test]

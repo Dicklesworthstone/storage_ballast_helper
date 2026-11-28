@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::path::Path;
 
 use super::{CandidateIndexRecord, CandidateSafetyState, ScannerCandidateIndex};
+use crate::scanner::planner::{SafetyObservation, rejected_scopes};
 
 impl ScannerCandidateIndex {
     /// Revoke replay hints overlapping changed paths or reconciliation scopes.
@@ -21,6 +22,27 @@ impl ScannerCandidateIndex {
     /// not the number of candidates. Returns the number of changed records.
     pub fn invalidate_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) -> usize {
         let scopes: BTreeSet<&Path> = paths.into_iter().collect();
+        if !self.aliases.is_empty() && !scopes.is_empty() {
+            // Changes below one observed alias also revoke positive hints
+            // above or below the corresponding subtree at another spelling.
+            let evidence = self.safety_observations().map(|row| SafetyObservation {
+                vetoed: false,
+                ..row
+            });
+            let events = scopes.iter().map(|path| SafetyObservation {
+                path,
+                identity: None,
+                vetoed: true,
+            });
+            let dirty = rejected_scopes(evidence.chain(events));
+            return self
+                .records
+                .values_mut()
+                .chain(self.aliases.values_mut())
+                .zip(dirty)
+                .map(|(row, dirty)| usize::from(dirty && revoke(row)))
+                .sum();
+        }
         let mut covered: Option<&Path> = None;
         let mut invalidated = 0;
         for scope in scopes {
