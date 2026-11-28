@@ -384,8 +384,11 @@ impl ProcessIoHistory {
                         && Instant::now() < deadline
                         && active() =>
                 {
-                    let _ = self.record_process_sample_at(
-                        snapshot.io,
+                    // Refresh every selected identity before evicting any:
+                    // a newly discovered PID earlier in this pass must not
+                    // discard the baseline of a writer we still observe.
+                    self.append_process_sample_at(
+                        &snapshot.io,
                         Some(snapshot.start_time_unix_ms),
                         collected_at_unix_ms,
                     );
@@ -420,6 +423,17 @@ impl ProcessIoHistory {
         start_time_unix_ms: Option<i64>,
         collected_at_unix_ms: i64,
     ) -> ProcessIo {
+        self.append_process_sample_at(&io, start_time_unix_ms, collected_at_unix_ms);
+        self.enforce_pid_limit();
+        self.io_with_recent_for_process_at(io, start_time_unix_ms, collected_at_unix_ms)
+    }
+
+    fn append_process_sample_at(
+        &mut self,
+        io: &ProcessIo,
+        start_time_unix_ms: Option<i64>,
+        collected_at_unix_ms: i64,
+    ) {
         let sample = ProcessIoSample {
             collected_at_unix_ms,
             bytes_read_total: io.bytes_read_total,
@@ -434,8 +448,6 @@ impl ProcessIoHistory {
         let samples = self.samples_by_process.entry(key).or_default();
         append_sample(samples, sample);
         prune_samples(samples, collected_at_unix_ms.saturating_sub(window_ms));
-        self.enforce_pid_limit();
-        self.io_with_recent_for_process_at(io, start_time_unix_ms, collected_at_unix_ms)
     }
 
     #[must_use]
@@ -577,26 +589,26 @@ impl ProcessIoHistory {
     }
 
     fn enforce_pid_limit(&mut self) {
-        while self.samples_by_process.len() > self.max_pids {
-            let Some(oldest_key) = self
-                .samples_by_process
-                .iter()
-                .filter_map(|(key, samples)| {
-                    samples.back().map(|sample| {
-                        (
-                            *key,
-                            (sample.collected_at_unix_ms, key.pid, key.start_time_unix_ms),
-                        )
-                    })
-                })
-                .min_by_key(|(_, last_seen)| *last_seen)
-                .map(|(key, _)| key)
-            else {
-                break;
-            };
-            // Evict by the latest observation, not the oldest baseline. A
-            // long-running writer with useful history is not an inactive PID.
-            self.samples_by_process.remove(&oldest_key);
+        let excess = self.samples_by_process.len().saturating_sub(self.max_pids);
+        if excess == 0 {
+            return;
+        }
+        // Identify the oldest entries once per batch. Repeatedly searching a
+        // full table costs a complete traversal for each new PID on busy hosts.
+        let mut observed: Vec<_> = self
+            .samples_by_process
+            .iter()
+            .map(|(key, samples)| {
+                let last_seen = samples.back().map(|sample| sample.collected_at_unix_ms);
+                (last_seen, key.pid, key.start_time_unix_ms)
+            })
+            .collect();
+        observed.select_nth_unstable(excess - 1);
+        for &(_, pid, start_time_unix_ms) in &observed[..excess] {
+            self.samples_by_process.remove(&ProcessIoHistoryKey {
+                pid,
+                start_time_unix_ms,
+            });
         }
     }
 }
@@ -1272,6 +1284,36 @@ mod tests {
         let report = sample_pass(&mut history, &[10, 20], 1, 1_000);
         assert_eq!(report.pids_recorded, 1);
         assert_eq!(history.last_sampled_pid, Some(20));
+    }
+
+    #[test]
+    fn saturated_sampling_pass_keeps_baselines_for_refreshed_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.max_pids = 3;
+        sample_pass(&mut history, &[40, 50, 60], 100, 0);
+        // New PIDs sort before both still-active writers. Evicting on each
+        // insertion used to destroy both baselines before refreshing them.
+        let report = sample_pass(&mut history, &[10, 20, 40, 50], 900, 1_000);
+        assert_eq!(report.pids_recorded, 4);
+        let mut retained: Vec<_> = history
+            .samples_by_process
+            .keys()
+            .map(|key| key.pid)
+            .collect();
+        retained.sort_unstable();
+        assert_eq!(retained, [20, 40, 50]);
+        for pid in [40, 50] {
+            let recent = history
+                .recent_totals_for_process(
+                    &io(pid, 0, 900),
+                    Some(0),
+                    SAMPLING_TEST_EPOCH_MS + 1_000,
+                    Duration::from_mins(15),
+                )
+                .expect("active writer retains an earlier observation");
+            assert_eq!(recent.bytes_written, 800);
+        }
     }
 
     #[test]
