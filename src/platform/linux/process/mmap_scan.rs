@@ -2,7 +2,8 @@
 //!
 //! The PAL's Vec-returning API cannot describe partial coverage. Incomplete
 //! snapshots therefore return an error, never a successful truncated vector.
-//! Reads are streamed, byte-preserving and cooperatively deadline-bounded.
+//! Reads are streamed and byte-preserving. The caller stops waiting at its
+//! deadline even if the kernel blocks a worker inside a single procfs read.
 //! This is not an atomic process/mount-namespace snapshot.
 
 use std::cell::Cell;
@@ -13,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -156,7 +157,9 @@ struct Cached {
 #[derive(Default)]
 struct Cache {
     value: Mutex<Option<Cached>>,
-    refresh: Mutex<()>,
+    // A timed-out waiter unlocks promptly. Its worker keeps the sole strong
+    // reference until the kernel read and the rest of the sweep finish.
+    refresh: Mutex<Weak<()>>,
 }
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -179,26 +182,26 @@ impl Cache {
     fn obtain(
         &self,
         now: impl Fn() -> Instant,
-        collect: impl FnOnce() -> Snapshot,
+        collect: impl FnOnce(&mut Weak<()>) -> Snapshot,
     ) -> Result<Arc<Snapshot>> {
         if let Some(snapshot) = self.fresh(now()) {
             return Ok(snapshot);
         }
         // Do not turn parallel root queries into parallel procfs sweeps, or
         // make a monitor wait behind a potentially stalled kernel read.
-        let Some(_refresh) = self.refresh.try_lock() else {
+        let Some(mut refresh) = self.refresh.try_lock() else {
             return Err(incomplete_error("another snapshot refresh is in progress"));
         };
         if let Some(snapshot) = self.fresh(now()) {
             return Ok(snapshot);
         }
-        Ok(self.collect_and_publish(now, collect))
+        self.collect_and_publish(&mut refresh, now, collect)
     }
 
     fn obtain_fresh(
         &self,
         now: impl Fn() -> Instant,
-        collect: impl FnOnce() -> Snapshot,
+        collect: impl FnOnce(&mut Weak<()>) -> Snapshot,
     ) -> Result<Arc<Snapshot>> {
         // An old refusal has no absence authority. Keep its bounded backoff
         // rather than repeat an expensive, inaccessible sweep per retry.
@@ -207,7 +210,7 @@ impl Cache {
         {
             return Ok(snapshot);
         }
-        let Some(_refresh) = self.refresh.try_lock() else {
+        let Some(mut refresh) = self.refresh.try_lock() else {
             return Err(incomplete_error("another snapshot refresh is in progress"));
         };
         if let Some(snapshot) = self.fresh(now())
@@ -217,17 +220,21 @@ impl Cache {
         }
         // Successful scanner observations, however recent, predate this
         // mutation check. Only a newly started sweep may admit it.
-        Ok(self.collect_and_publish(now, collect))
+        self.collect_and_publish(&mut refresh, now, collect)
     }
 
     // The caller holds `refresh`, so at most one process sweep runs at once.
     fn collect_and_publish(
         &self,
+        worker: &mut Weak<()>,
         now: impl Fn() -> Instant,
-        collect: impl FnOnce() -> Snapshot,
-    ) -> Arc<Snapshot> {
+        collect: impl FnOnce(&mut Weak<()>) -> Snapshot,
+    ) -> Result<Arc<Snapshot>> {
+        if worker.strong_count() != 0 {
+            return Err(incomplete_error("previous mapping worker is still running"));
+        }
         let started = now();
-        let mut snapshot = collect();
+        let mut snapshot = collect(worker);
         let finished = now();
         if finished
             .checked_duration_since(started)
@@ -247,7 +254,51 @@ impl Cache {
             at,
             snapshot: Arc::clone(&snapshot),
         });
-        snapshot
+        Ok(snapshot)
+    }
+}
+
+fn native_snapshot(worker: &mut Weak<()>) -> Snapshot {
+    let limits = Limits::default();
+    bounded_snapshot(worker, limits.time, move || {
+        collect(&Native, Path::new(PROC_ROOT), limits)
+    })
+}
+
+// Only the waiting caller publishes into Cache. A worker that returns after
+// timeout can drop its result, but cannot replace the cached refusal.
+fn bounded_snapshot(
+    worker: &mut Weak<()>,
+    budget: Duration,
+    collect: impl FnOnce() -> Snapshot + Send + 'static,
+) -> Snapshot {
+    let start = Instant::now();
+    let lease = Arc::new(());
+    *worker = Arc::downgrade(&lease);
+    let (reply, result) = mpsc::sync_channel(1);
+    let task = std::thread::Builder::new()
+        .name("sbh-linux-mappings".to_owned())
+        .spawn(move || {
+            let snapshot = collect();
+            drop(lease);
+            let _ = reply.send(snapshot);
+        });
+
+    let reason = match task {
+        Ok(_) => match result.recv_timeout(budget.saturating_sub(start.elapsed())) {
+            Ok(snapshot) if start.elapsed() < budget => return snapshot,
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                "mapping worker exceeded caller deadline".to_owned()
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                "mapping worker exited without a result".to_owned()
+            }
+        },
+        Err(error) => format!("starting mapping worker failed: {error}"),
+    };
+    Snapshot {
+        incomplete: Some(reason),
+        ..Snapshot::default()
     }
 }
 
@@ -267,9 +318,7 @@ pub(super) fn read_under_roots_fresh(roots: &[PathBuf]) -> Result<Vec<MappedRegi
     }
     let snapshot = CACHE
         .get_or_init(Cache::default)
-        .obtain_fresh(Instant::now, || {
-            collect(&Native, Path::new(PROC_ROOT), Limits::default())
-        })?;
+        .obtain_fresh(Instant::now, native_snapshot)?;
     snapshot.under_roots(roots)
 }
 
@@ -280,9 +329,9 @@ pub(super) fn read_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let snapshot = CACHE.get_or_init(Cache::default).obtain(Instant::now, || {
-        collect(&Native, Path::new(PROC_ROOT), Limits::default())
-    })?;
+    let snapshot = CACHE
+        .get_or_init(Cache::default)
+        .obtain(Instant::now, native_snapshot)?;
     snapshot.under_roots(roots)
 }
 
@@ -1358,7 +1407,7 @@ mod tests {
         cache
             .obtain(
                 || clock.get(),
-                || {
+                |_| {
                     count.set(count.get() + 1);
                     clock.set(start + Duration::from_secs(10));
                     Snapshot::default()
@@ -1368,7 +1417,7 @@ mod tests {
         clock.set(start + Duration::from_secs(29));
         assert!(
             cache
-                .obtain(|| clock.get(), || panic!("must reuse"))
+                .obtain(|| clock.get(), |_| panic!("must reuse"))
                 .unwrap()
                 .under(Path::new("/a"))
                 .is_ok()
@@ -1377,7 +1426,7 @@ mod tests {
         cache
             .obtain(
                 || clock.get(),
-                || {
+                |_| {
                     count.set(count.get() + 1);
                     Snapshot::default()
                 },
@@ -1394,7 +1443,7 @@ mod tests {
         let start = Instant::now();
         assert!(
             cache
-                .obtain(|| start, || fixture.scan(&Native, Limits::default()))
+                .obtain(|| start, |_| fixture.scan(&Native, Limits::default()))
                 .unwrap()
                 .under(&fixture.root)
                 .unwrap()
@@ -1407,7 +1456,7 @@ mod tests {
             cache
                 .obtain(
                     || check_at,
-                    || panic!("ordinary queries still reuse the cache")
+                    |_| panic!("ordinary queries still reuse the cache")
                 )
                 .unwrap()
                 .under(&fixture.root)
@@ -1415,7 +1464,7 @@ mod tests {
                 .is_empty()
         );
         let current = cache
-            .obtain_fresh(|| check_at, || fixture.scan(&Native, Limits::default()))
+            .obtain_fresh(|| check_at, |_| fixture.scan(&Native, Limits::default()))
             .unwrap()
             .under(&fixture.root)
             .unwrap();
@@ -1423,7 +1472,7 @@ mod tests {
         assert_eq!(current[0].path, fixture.root.join("new-reader"));
         assert_eq!(
             cache
-                .obtain(|| check_at, || panic!("the new snapshot is shared"))
+                .obtain(|| check_at, |_| panic!("the new snapshot is shared"))
                 .unwrap()
                 .under(&fixture.root)
                 .unwrap()
@@ -1436,9 +1485,9 @@ mod tests {
     fn fresh_query_never_falls_back_to_cached_success_during_contention() {
         let cache = Cache::default();
         let start = Instant::now();
-        cache.obtain(|| start, Snapshot::default).unwrap();
+        cache.obtain(|| start, |_| Snapshot::default()).unwrap();
         let _refresh = cache.refresh.lock();
-        let result = cache.obtain_fresh(|| start, || panic!("parallel sweep"));
+        let result = cache.obtain_fresh(|| start, |_| panic!("parallel sweep"));
         assert!(result.is_err());
         assert!(
             result
@@ -1453,12 +1502,12 @@ mod tests {
     fn fresh_query_keeps_failed_evidence_closed_with_bounded_retry_work() {
         let cache = Cache::default();
         let start = Instant::now();
-        cache.obtain(|| start, Snapshot::default).unwrap();
+        cache.obtain(|| start, |_| Snapshot::default()).unwrap();
         let failed_at = start + Duration::from_secs(1);
         let failed = cache
             .obtain_fresh(
                 || failed_at,
-                || {
+                |_| {
                     let mut snapshot = Snapshot::default();
                     snapshot.fail("new process maps unavailable");
                     snapshot
@@ -1471,7 +1520,7 @@ mod tests {
                 cache
                     .obtain_fresh(
                         || failed_at + Duration::from_secs(second),
-                        || panic!("failed queries must not repeat a process sweep per retry"),
+                        |_| panic!("failed queries must not repeat a process sweep per retry"),
                     )
                     .unwrap()
                     .under(Path::new("/"))
@@ -1480,7 +1529,7 @@ mod tests {
         }
         assert!(
             cache
-                .obtain_fresh(|| failed_at + FAILURE_TTL, Snapshot::default)
+                .obtain_fresh(|| failed_at + FAILURE_TTL, |_| Snapshot::default())
                 .unwrap()
                 .under(Path::new("/"))
                 .is_ok()
@@ -1491,12 +1540,12 @@ mod tests {
     fn failed_refresh_never_resurrects_old_success_and_has_a_bounded_retry_backoff() {
         let cache = Cache::default();
         let start = Instant::now();
-        cache.obtain(|| start, Snapshot::default).unwrap();
+        cache.obtain(|| start, |_| Snapshot::default()).unwrap();
         let failed_at = start + SNAPSHOT_TTL;
         let failed = cache
             .obtain(
                 || failed_at,
-                || {
+                |_| {
                     let mut result = Snapshot::default();
                     result.fail("denied");
                     result
@@ -1508,7 +1557,7 @@ mod tests {
             cache
                 .obtain(
                     || failed_at + Duration::from_secs(1),
-                    || panic!("must back off")
+                    |_| panic!("must back off")
                 )
                 .unwrap()
                 .under(Path::new("/"))
@@ -1516,7 +1565,7 @@ mod tests {
         );
         assert!(
             cache
-                .obtain(|| failed_at + FAILURE_TTL, Snapshot::default)
+                .obtain(|| failed_at + FAILURE_TTL, |_| Snapshot::default())
                 .unwrap()
                 .under(Path::new("/"))
                 .is_ok()
@@ -1531,7 +1580,7 @@ mod tests {
         let result = cache
             .obtain(
                 || clock.get(),
-                || {
+                |_| {
                     clock.set(start + SNAPSHOT_TTL);
                     Snapshot::default()
                 },
@@ -1549,7 +1598,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let first = Arc::clone(&cache);
         let worker = thread::spawn(move || {
-            first.obtain(Instant::now, || {
+            first.obtain(Instant::now, |_| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Snapshot::default()
@@ -1559,7 +1608,7 @@ mod tests {
         let second = Arc::clone(&cache);
         let (reply_tx, reply_rx) = mpsc::channel();
         let requester = thread::spawn(move || {
-            let result = second.obtain(Instant::now, || panic!("duplicate sweep"));
+            let result = second.obtain(Instant::now, |_| panic!("duplicate sweep"));
             reply_tx.send(result.is_err()).unwrap();
         });
         let refused = reply_rx.recv_timeout(Duration::from_secs(1));
@@ -1569,9 +1618,127 @@ mod tests {
         assert!(refused.unwrap());
         assert!(
             cache
-                .obtain(Instant::now, || panic!("already refreshed"))
+                .obtain(Instant::now, |_| panic!("already refreshed"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn stalled_maps_read_times_out_once_and_its_late_absence_cannot_admit_mutation() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        // A socket provides a real read syscall that stays blocked until the
+        // test releases it, even though the cooperative budget has not elapsed.
+        struct GatedMaps {
+            stream: UnixStream,
+            entered: mpsc::Sender<()>,
+        }
+        impl Access for GatedMaps {
+            fn entries(&self, path: &Path) -> io::Result<Entries> {
+                Native.entries(path)
+            }
+            fn open(&self, path: &Path) -> io::Result<Box<dyn Read>> {
+                if path.file_name() == Some(OsStr::new("maps")) {
+                    self.entered.send(()).unwrap();
+                    return Ok(Box::new(self.stream.try_clone()?));
+                }
+                Native.open(path)
+            }
+            fn gone(&self, path: &Path) -> bool {
+                Native.gone(path)
+            }
+            fn now(&self) -> Instant {
+                Native.now()
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.maps(1, &fixture.row("held"));
+        let root = fixture.root.clone();
+        let cache = Arc::new(Cache::default());
+        let start = Instant::now();
+        cache.obtain(|| start, |_| Snapshot::default()).unwrap();
+
+        let (stream, mut release) = UnixStream::pair().unwrap();
+        let (entered, reading) = mpsc::channel();
+        let (reply, result) = mpsc::channel();
+        let requester_cache = Arc::clone(&cache);
+        let requester = thread::spawn(move || {
+            let sample = requester_cache.obtain_fresh(
+                || start,
+                |worker| {
+                    bounded_snapshot(worker, Duration::from_millis(50), move || {
+                        fixture.scan(&GatedMaps { stream, entered }, Limits::default())
+                    })
+                },
+            );
+            reply.send(sample).unwrap();
+        });
+        reading.recv_timeout(Duration::from_secs(5)).unwrap();
+        let refused = result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(
+            refused
+                .under(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("caller deadline")
+        );
+        requester.join().unwrap();
+
+        let retry = start + FAILURE_TTL;
+        assert!(
+            cache
+                .obtain(|| start, |_| panic!("timeout must replace cached absence"))
+                .unwrap()
+                .under(&root)
+                .is_err()
+        );
+        for attempt in 0..3 {
+            let at = retry + Duration::from_secs(attempt);
+            assert!(
+                cache
+                    .obtain_fresh(|| at, |_| panic!("duplicate worker"))
+                    .is_err()
+            );
+            assert!(cache.obtain(|| at, |_| panic!("duplicate worker")).is_err());
+        }
+
+        // This late, complete sweep sees only anonymous memory, which normally
+        // would authorize deletion. Its caller has already refused the request.
+        release
+            .write_all(b"1000-2000 rw-p 00000000 00:00 0 [heap]\n")
+            .unwrap();
+        drop(release);
+        let stop = Instant::now() + Duration::from_secs(5);
+        while cache.refresh.lock().strong_count() != 0 {
+            assert!(
+                Instant::now() < stop,
+                "released mapping worker did not finish"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cache.fresh(start).unwrap().under(&root).is_err());
+        assert!(
+            cache
+                .obtain_fresh(|| start, |_| panic!("failure backoff must survive"))
+                .unwrap()
+                .under(&root)
+                .is_err()
+        );
+
+        // Only a different, timely sweep can supply evidence once the backoff expires.
+        let current = cache
+            .obtain_fresh(
+                || retry,
+                |worker| bounded_snapshot(worker, Duration::from_secs(5), Snapshot::default),
+            )
+            .unwrap();
+        assert!(current.under(&root).unwrap().is_empty());
     }
 
     #[test]
