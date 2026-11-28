@@ -75,12 +75,13 @@ use storage_ballast_helper::scanner::deletion::{
     DeletionConfig, DeletionConfirmation, DeletionConfirmationError, DeletionError,
     DeletionExecutor, DeletionMode, DeletionPlan, DeletionReport, SkipCheck, SkipReason,
 };
+use storage_ballast_helper::scanner::coverage::{CleanupWalk, WalkRejection};
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
 use storage_ballast_helper::scanner::planner::{
-    BatchPlan, PlanObjective, PlanRequest, admit_candidates, plan_batch, rejected_observations,
+    BatchPlan, PlanObjective, PlanRequest, admit_candidates, plan_batch,
 };
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::{
@@ -14229,25 +14230,26 @@ impl ScanReportRows {
 
 fn scan_report_rows(
     entries: Vec<ScoredScanEntry>,
+    rejections: Vec<WalkRejection>,
     min_score: f64,
     top: usize,
     explain: bool,
 ) -> ScanReportRows {
-    // Even an unrankable observation can link an alias to a protected subtree.
-    // Resolve the complete snapshot before applying either display limit.
-    let vetoes = rejected_observations(entries.iter().map(|entry| &entry.score));
+
     let mut rows = ScanReportRows {
         candidates: Vec::new(),
         report_only: Vec::new(),
         rejected: Vec::new(),
     };
-    for (mut entry, vetoed) in entries.into_iter().zip(vetoes) {
-        if vetoed {
+    for (mut entry, rejection) in entries.into_iter().zip(rejections) {
+        if rejection != WalkRejection::Admitted {
             if is_report_only_scan_entry(&entry) {
                 rows.report_only.push(entry);
             } else if explain {
                 let reason = entry.score.veto_reason.get_or_insert_with(|| {
-                    if entry.score.decision.category_suspended {
+                    if rejection == WalkRejection::Uncovered {
+                        "cleanup scope contains a directory the scan could not cover".into()
+                    } else if entry.score.decision.category_suspended {
                         "cleanup is suspended for this category".into()
                     } else if entry.score.vetoed {
                         "hard veto from scoring".into()
@@ -14533,12 +14535,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             .collect::<HashSet<_>>(),
         opaque_pruning: scanner_opaque_pruning,
     };
-    let walker = DirectoryWalker::new(walker_config, protection);
-
-    // Walk the filesystem.
-    let entries = walker
-        .walk()
+    let walk = CleanupWalk::collect(walker_config, protection)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let entries = &walk.entries;
+    let walker = &walk.walker;
     let dir_count = entries.len();
 
     // Classify and score each entry with active-reference evidence attached.
@@ -14629,7 +14629,14 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         })
         .collect::<Vec<_>>();
 
-    let rows = scan_report_rows(scored_entries, args.min_score, args.top, args.explain);
+    let rejections = walk.rejections(scored_entries.iter().map(|entry| &entry.score));
+    let rows = scan_report_rows(
+        scored_entries,
+        rejections,
+        args.min_score,
+        args.top,
+        args.explain,
+    );
     let candidates = rows.displayed_candidates(args.top);
     let report_only = &rows.report_only;
     let rejected = &rows.rejected;
@@ -14866,6 +14873,8 @@ struct ScanAbPass {
     process_cpu_micros: Option<u64>,
     candidates: Vec<ScanAbCandidate>,
     hard_vetoes: Vec<ScanAbVeto>,
+    /// Paths held because this engine could not inspect the whole cleanup scope.
+    coverage_holds: Vec<String>,
 }
 
 /// Candidate-set differences between the two A/B passes (all sorted by path).
@@ -14915,8 +14924,7 @@ fn scan_ab_pass(
             .collect::<HashSet<_>>(),
         opaque_pruning: selected_scanner_engine.opaque_pruning(),
     };
-    let entries = DirectoryWalker::new(walker_config, protection)
-        .walk()
+    let walk = CleanupWalk::collect(walker_config, protection)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     let registry = ArtifactPatternRegistry::default();
@@ -14929,7 +14937,8 @@ fn scan_ab_pass(
     let mut candidates: Vec<ScanAbCandidate> = Vec::new();
     let mut hard_vetoes: Vec<ScanAbVeto> = Vec::new();
 
-    for entry in &entries {
+    let mut scores = Vec::new();
+    for entry in &walk.entries {
         let (classification, classified_tree_modified) =
             if let Some(opaque_tree) = &entry.opaque_tree {
                 match opaque_tree.disposition {
@@ -14963,19 +14972,29 @@ fn scan_ab_pass(
             is_open: false,
             excluded: false,
         };
-        let (score, _) = score_candidate_with_deferred_sacred_check(
+        let (mut score, _) = score_candidate_with_deferred_sacred_check(
             &engine,
             &candidate,
             0.0,
             &sacred_paths,
             |_| false,
         );
-        if score.vetoed {
+        score.identity = Some(entry.metadata.identity());
+        scores.push(score);
+    }
+    let mut coverage_holds = Vec::new();
+    let rejections = walk.rejections(&scores);
+    for (score, rejection) in scores.into_iter().zip(rejections) {
+        if rejection == WalkRejection::Uncovered {
+            coverage_holds.push(score.path.to_string_lossy().into_owned());
+        } else if rejection == WalkRejection::Veto {
             hard_vetoes.push(ScanAbVeto {
                 path: score.path.to_string_lossy().into_owned(),
                 reason: score
                     .veto_reason
-                    .unwrap_or_else(|| "vetoed".into())
+                    .unwrap_or_else(|| {
+                        "cleanup scope overlaps a vetoed or suspended observation".into()
+                    })
                     .into_owned(),
             });
         } else if score.total_score >= min_score {
@@ -14990,11 +15009,12 @@ fn scan_ab_pass(
 
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     hard_vetoes.sort_by(|a, b| a.path.cmp(&b.path));
+    coverage_holds.sort();
 
     Ok(ScanAbPass {
         engine: mode.to_string(),
         dispatch: selected_scanner_engine.dispatch().to_string(),
-        scanned_entries: entries.len(),
+        scanned_entries: walk.entries.len(),
         opaque_pruned_dirs,
         elapsed_seconds: start.elapsed().as_secs_f64(),
         process_cpu_micros: cpu_start_micros
@@ -15002,6 +15022,7 @@ fn scan_ab_pass(
             .map(|(start, end)| end.saturating_sub(start)),
         candidates,
         hard_vetoes,
+        coverage_holds,
     })
 }
 
@@ -15149,12 +15170,12 @@ fn print_scan_ab_summary(
     };
     println!("Scanner A/B Comparison");
     println!(
-        "  {:<6} {:>10} {:>13} {:>10} {:>10} {:>9} {:>8}",
-        "Engine", "Entries", "OpaquePruned", "CPU s", "Wall s", "Cands", "Vetoes"
+        "  {:<6} {:>10} {:>13} {:>10} {:>10} {:>9} {:>8} {:>10}",
+        "Engine", "Entries", "OpaquePruned", "CPU s", "Wall s", "Cands", "Vetoes", "Uncovered"
     );
     for pass in [v1, v2] {
         println!(
-            "  {:<6} {:>10} {:>13} {:>10} {:>10.2} {:>9} {:>8}",
+            "  {:<6} {:>10} {:>13} {:>10} {:>10.2} {:>9} {:>8} {:>10}",
             pass.engine,
             pass.scanned_entries,
             pass.opaque_pruned_dirs,
@@ -15162,6 +15183,7 @@ fn print_scan_ab_summary(
             pass.elapsed_seconds,
             pass.candidates.len(),
             pass.hard_vetoes.len(),
+            pass.coverage_holds.len(),
         );
     }
     println!();
@@ -24228,7 +24250,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         for explain in [false, true] {
-            let rows = scan_report_rows(entries.clone(), 0.5, 1, explain);
+            let vetoes = storage_ballast_helper::scanner::planner::rejected_observations(
+                entries.iter().map(|entry| &entry.score),
+            );
+            let rejections = vetoes
+                .into_iter()
+                .map(|held| {
+                    if held {
+                        WalkRejection::Veto
+                    } else {
+                        WalkRejection::Admitted
+                    }
+                })
+                .collect();
+            let rows = scan_report_rows(entries.clone(), rejections, 0.5, 1, explain);
             assert_eq!(rows.candidates.len(), 1);
             assert_eq!(rows.candidates[0].score.path, Path::new("/a/clear"));
             assert_eq!(rows.candidates[0].score.size_bytes, 80);
@@ -24258,6 +24293,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scan_forecast_excludes_uncovered_scopes_and_explains_the_hold() {
+        let held = cli_filesystem_candidate("/a", 1, 10, 900);
+        let clear = cli_filesystem_candidate("/b", 2, 11, 80);
+        let entries = vec![observed_scan_entry(held), observed_scan_entry(clear)];
+        let rows = scan_report_rows(
+            entries,
+            vec![WalkRejection::Uncovered, WalkRejection::Admitted],
+            0.0,
+            5,
+            true,
+        );
+        assert_eq!(rows.candidates.len(), 1);
+        assert_eq!(rows.candidates[0].score.path, Path::new("/b"));
+        assert_eq!(rows.rejected.len(), 1);
+        assert_eq!(rows.rejected[0].trace.final_action, "Keep");
+        assert!(
+            rows.rejected[0]
+                .trace
+                .veto_reason
+                .as_deref()
+                .unwrap()
+                .contains("could not cover")
+        );
+        assert!(rows.report_only.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scan_display_limit_keeps_lower_ranked_filesystems_in_the_plan() {
         let config = Config::default();
         let roots = [PathBuf::from("/healthy"), PathBuf::from("/full")];
@@ -24267,7 +24330,8 @@ mod tests {
         let scores = vec![large, small];
         for top in [0, 1, 2] {
             let entries = scores.iter().cloned().map(observed_scan_entry).collect();
-            let rows = scan_report_rows(entries, 0.5, top, false);
+            let rows =
+                scan_report_rows(entries, vec![WalkRejection::Admitted; 2], 0.5, top, false);
             let displayed = rows.displayed_candidates(top);
             assert_eq!(displayed.len(), top);
             let displayed_bytes: u64 = displayed.iter().map(|entry| entry.score.size_bytes).sum();
@@ -29073,6 +29137,7 @@ mod tests {
             process_cpu_micros: Some(1_000_000),
             candidates,
             hard_vetoes,
+            coverage_holds: Vec::new(),
         }
     }
 
