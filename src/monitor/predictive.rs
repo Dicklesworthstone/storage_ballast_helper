@@ -581,21 +581,9 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
 /// A currently rapid writer can still qualify for immediate rescue, and a
 /// steadily draining filesystem can tolerate an occasional idle sample.
 fn measured_runway_floor(estimate: &RateEstimate) -> f64 {
-    let burst = &estimate.burst_state;
-    if !burst.calibrated {
-        return 0.0;
-    }
-    let Some(rate) = burst.latest_rate else {
+    let Some(rate) = estimate.unconfirmed_drain_ceiling() else {
         return 0.0;
     };
-    let rate = rate.max(burst.median_drain_rate);
-    // Preserve conformal early warning for ordinary consumption. A shorter
-    // corrected horizon alone does not mean an EWMA was inflated by churn.
-    if burst.median_drain_rate > 0.0
-        && (burst.median_drain_rate >= burst.median_rate || estimate.bytes_per_second <= rate)
-    {
-        return 0.0;
-    }
     if rate <= 0.0 {
         return f64::INFINITY;
     }

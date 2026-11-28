@@ -295,19 +295,22 @@ impl SpecialLocationRates {
                 rate_state
                     .estimator
                     .update(stats.available_bytes, sample.collected_at, 0);
-            // A positive trailing EWMA must not keep a horizon alert alive
-            // once the current interval shows that space stopped shrinking.
-            rate_state.rate = if stats.available_bytes >= rate_state.sample.stats.available_bytes {
-                Some(0.0)
-            } else {
-                // Use the same elapsed-time projection as ordinary filesystem
-                // forecasts. A short allocation can move the immediate EWMA
-                // far above a mount's sustained net drain.
-                let rate = estimate
-                    .forecast_rate_bytes_per_second
-                    .unwrap_or(estimate.bytes_per_second);
-                (!estimate.fallback_active && rate.is_finite()).then(|| rate.max(0.0))
-            };
+            // A flat or freeing interval can be part of a sustained net
+            // drain. Only the elapsed-time forecast can carry that evidence
+            // across such an interval; a trailing EWMA or mount prior cannot.
+            let shrinking = stats.available_bytes < rate_state.sample.stats.available_bytes;
+            let immediate_rate = estimate.bytes_per_second.min(
+                estimate
+                    .unconfirmed_drain_ceiling()
+                    .unwrap_or(f64::INFINITY),
+            );
+            let measured = estimate
+                .forecast_rate_bytes_per_second
+                .or(shrinking.then_some(immediate_rate))
+                .filter(|rate| !estimate.fallback_active && rate.is_finite());
+            rate_state.rate = measured
+                .map(|rate| rate.max(0.0))
+                .or_else(|| (!shrinking).then_some(0.0));
             rate_state.sample = sample.clone();
         }
         let prior = rate_state
@@ -673,6 +676,82 @@ mod rate_tests {
             SpecialAlert::Critical,
             "the sustained writer must alert"
         );
+    }
+
+    #[test]
+    fn pulsed_special_mount_keeps_its_short_runway_until_the_writer_stops() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let mut current = sample("/", "tmpfs-a", 10 * GIB, start);
+        let rule = HorizonRule::default();
+        let mut alert = SpecialAlert::None;
+        for step in 0..=84 {
+            current.collected_at = start + Duration::from_secs(step * 5);
+            if (1..=72).contains(&step) {
+                // 120 MiB consumed each 20 s, including one quiet interval
+                // and one small release. Free space stays above the RAM
+                // buffer, so this warning is driven entirely by runway.
+                let change_mib = match step % 4 {
+                    1 | 3 => -70,
+                    2 => 0,
+                    _ => 20,
+                };
+                current.stats.available_bytes = current
+                    .stats
+                    .available_bytes
+                    .checked_add_signed(change_mib * (1_i64 << 20))
+                    .unwrap();
+                current.stats.free_bytes = current.stats.available_bytes;
+            }
+            let rate = observe(&mut rates, &current, current.collected_at, None).unwrap();
+            assert!(current.stats.free_pct() > RAM_BACKED_MIN_FREE_PCT);
+            alert = rule.assess(&location(), &current.stats, rate, true).alert;
+            if (60..=72).contains(&step) {
+                assert_eq!(alert, SpecialAlert::Critical, "step={step}, rate={rate}");
+            }
+        }
+        assert_eq!(
+            alert,
+            SpecialAlert::None,
+            "one minute without a writer clears the forecast"
+        );
+    }
+
+    #[test]
+    fn special_horizon_uses_current_drain_after_frees_and_a_short_write_burst() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let mut current = sample("/", "tmpfs-a", 4000 * (1 << 20), start);
+        let rule = HorizonRule::default();
+        observe(&mut rates, &current, start, None);
+        let mut tick = 0;
+        for (ticks, change_mib) in [(60, 100), (25, -1), (10, -100), (1, -1)] {
+            for _ in 0..ticks {
+                tick += 1;
+                current.collected_at = start + Duration::from_secs(tick);
+                current.stats.available_bytes = current
+                    .stats
+                    .available_bytes
+                    .checked_add_signed(change_mib * (1_i64 << 20))
+                    .unwrap();
+                current.stats.free_bytes = current.stats.available_bytes;
+                let rate = observe(&mut rates, &current, current.collected_at, None).unwrap();
+                let alert = rule.assess(&location(), &current.stats, rate, true).alert;
+                if tick == 95 {
+                    assert_eq!(
+                        alert,
+                        SpecialAlert::Critical,
+                        "rapid writer is still active"
+                    );
+                } else if tick == 96 {
+                    assert_eq!(
+                        alert,
+                        SpecialAlert::None,
+                        "background writer has over two hours of runway"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

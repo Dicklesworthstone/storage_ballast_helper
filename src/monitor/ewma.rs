@@ -96,6 +96,27 @@ pub struct RateEstimate {
     pub free_bytes: u64,
 }
 
+impl RateEstimate {
+    /// Upper bound on an uncorroborated drain after an idle or freeing-heavy
+    /// baseline. A currently rapid writer can still qualify for immediate
+    /// rescue, and a normally draining volume can tolerate an idle interval.
+    pub(super) fn unconfirmed_drain_ceiling(&self) -> Option<f64> {
+        let burst = &self.burst_state;
+        if !burst.calibrated {
+            return None;
+        }
+        let rate = burst.latest_rate?.max(burst.median_drain_rate);
+        // Preserve conformal early warning for ordinary consumption. A shorter
+        // corrected horizon alone does not mean an EWMA was inflated by churn.
+        if burst.median_drain_rate > 0.0
+            && (burst.median_drain_rate >= burst.median_rate || self.bytes_per_second <= rate)
+        {
+            return None;
+        }
+        Some(rate)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SampleState {
     free_bytes: u64,
