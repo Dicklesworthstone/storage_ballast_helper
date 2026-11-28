@@ -1307,27 +1307,7 @@ impl DeletionExecutor {
                 .filter(|(index, _)| vetoes.get(*index) != Some(&true))
                 .map(|(_, candidate)| candidate.path.clone())
                 .collect::<Vec<_>>();
-            let descriptors = self.platform.as_ref().map_or_else(
-                || {
-                    #[cfg(target_os = "linux")]
-                    {
-                        open_paths_for_batch(&roots)
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        walker::collect_open_path_ancestors(&roots)
-                    }
-                },
-                |platform| {
-                    walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &roots)
-                },
-            );
-            let native = crate::platform::current();
-            let (paths, complete) = walker::mutation_reference_paths(
-                self.platform.as_deref().unwrap_or(&native),
-                &roots,
-                descriptors,
-            );
+            let (paths, complete) = self.fresh_references_for_batch(&roots);
 
             if !complete {
                 self.log_event(incomplete_scan_event(scans_without_root()));
@@ -1629,6 +1609,67 @@ impl DeletionExecutor {
         report
     }
 
+    // The process inventory uses physical paths. Bind each candidate with a
+    // fresh filesystem lookup so a scan-time cache of a retargeted ancestor
+    // cannot turn a held subtree into a clear one. Pin refusals to both names.
+    fn fresh_references_for_batch(&self, roots: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+        let mut held = HashSet::new();
+        let mut bindings = Vec::with_capacity(roots.len());
+        let mut physical = Vec::with_capacity(roots.len());
+        for root in roots {
+            match fs::canonicalize(root) {
+                Ok(path) if crate::core::paths::resolve_absolute_path(&path) == path => {
+                    physical.push(path);
+                    bindings.push(root);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    // Preflight reports PathGone for a vanished candidate.
+                    // If the spelling reappears, this sweep cannot admit it.
+                    held.insert(root.clone());
+                }
+                _ => return (held, false),
+            }
+        }
+        if physical.is_empty() {
+            return (held, true);
+        }
+        let descriptors = self.platform.as_ref().map_or_else(
+            || {
+                #[cfg(target_os = "linux")]
+                {
+                    open_paths_for_batch(&physical)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    walker::collect_open_path_ancestors(&physical)
+                }
+            },
+            |platform| {
+                walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &physical)
+            },
+        );
+        let native = crate::platform::current();
+        let (mut paths, complete) = walker::mutation_reference_paths(
+            self.platform.as_deref().unwrap_or(&native),
+            &physical,
+            descriptors,
+        );
+        for (original, physical) in bindings.into_iter().zip(&physical) {
+            if paths.contains(physical)
+                || !fs::canonicalize(original).is_ok_and(|current| current == *physical)
+            {
+                held.insert(original.clone());
+            }
+        }
+        paths.extend(held);
+        (paths, complete)
+    }
+
     /// Delete one candidate through the full batch-mode safety stack: the
     /// complete `preflight_check` veto suite (hardcoded source-tree floor,
     /// scoring eligibility, active lease, symlink, identity, source markers,
@@ -1641,7 +1682,8 @@ impl DeletionExecutor {
     ///
     /// `open_paths` carries a fresh, complete open-file ancestor index for the
     /// open-file veto. Missing evidence is refused when `check_open_files` is
-    /// enabled; an empty completed scan is `Some(empty)`, not `None`.
+    /// enabled. Before mutation the executor also renews native descriptor,
+    /// executable, and mapping evidence for the candidate.
     pub fn delete_candidate_checked(
         &self,
         candidate: &CandidacyScore,
@@ -1663,8 +1705,18 @@ impl DeletionExecutor {
         if let Err(skip) = self.preflight_check(candidate, open_paths, &mut sacred) {
             return Ok(CheckedDeletion::Skipped(skip));
         }
-        if self.config.check_open_files && open_paths.is_none() {
-            return Ok(CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete));
+        if self.config.check_open_files {
+            if open_paths.is_none() {
+                return Ok(CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete));
+            }
+            let (paths, complete) =
+                self.fresh_references_for_batch(std::slice::from_ref(&candidate.path));
+            if !complete {
+                return Ok(CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete));
+            }
+            if walker::is_path_open_by_ancestor(&candidate.path, &paths) {
+                return Ok(CheckedDeletion::Skipped(SkipReason::FileOpen));
+            }
         }
         let started = Instant::now();
         let quarantined = match self.config.mode {
@@ -7766,6 +7818,48 @@ mod tests {
             assert!(mapped.join("objects/data.bin").is_file());
             assert!(!idle.exists());
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn both_mutation_entries_refresh_reference_scope_after_parent_alias_changes() {
+        use crate::platform::types::MappedRegion;
+
+        let dir = scratch_dir();
+        let old = dir.path().join("old");
+        let current = dir.path().join("current");
+        let alias = dir.path().join("alias");
+        for root in [&old, &current] {
+            fs::create_dir_all(root.join("target")).unwrap();
+            fs::write(root.join("target/output"), b"live").unwrap();
+        }
+        std::os::unix::fs::symlink(&old, &alias).unwrap();
+        let spelled = alias.join("target");
+        assert_eq!(
+            crate::core::paths::resolve_absolute_path(&spelled),
+            fs::canonicalize(old.join("target")).unwrap()
+        );
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&current, &alias).unwrap();
+        let platform =
+            crate::platform::pal::MockPlatform::healthy().with_mmap_region(MappedRegion {
+                pid: 47,
+                path: fs::canonicalize(current.join("target/output")).unwrap(),
+                start_address: None,
+                end_address: None,
+                protection: None,
+            });
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None)
+            .with_platform(Arc::new(platform));
+        let candidate = make_identity_candidate(&spelled, 4, 0.95);
+        let direct = executor
+            .delete_candidate_checked(&candidate, Some(&HashSet::new()))
+            .unwrap();
+        assert_eq!(direct, CheckedDeletion::Skipped(SkipReason::FileOpen));
+        let report = executor.execute(&executor.plan(vec![candidate]), None);
+        assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+        assert!(current.join("target/output").is_file());
+        assert!(old.join("target/output").is_file());
     }
 
     #[test]
