@@ -40,7 +40,7 @@ pub struct BurstState {
     /// Median bytes consumed per observed interval, expressed as a rate.
     /// Idle and freeing intervals contribute zero to this baseline.
     pub median_drain_rate: f64,
-    /// Signed rate of the latest observed interval, when calibrated. Unlike
+    /// Signed rate of the latest observed interval. Unlike
     /// the EWMA or the positive-only median, this records whether consumption
     /// actually continued after a burst. `None` means no measured evidence.
     pub latest_rate: Option<f64>,
@@ -102,9 +102,6 @@ impl RateEstimate {
     /// rescue, and a normally draining volume can tolerate an idle interval.
     pub(super) fn unconfirmed_drain_ceiling(&self) -> Option<f64> {
         let burst = &self.burst_state;
-        if !burst.calibrated {
-            return None;
-        }
         let rate = burst.latest_rate?.max(burst.median_drain_rate);
         // Preserve conformal early warning for ordinary consumption. A shorter
         // corrected horizon alone does not mean an EWMA was inflated by churn.
@@ -625,7 +622,7 @@ impl DiskRateEstimator {
     /// Compute burst detection state from the rate history ring buffer.
     fn compute_burst_state(&mut self, latest_rate: f64, new_sample: bool) -> BurstState {
         let calibrated = self.rate_history.len() >= BURST_CALIBRATION_MIN;
-        if !calibrated || self.rate_history.is_empty() {
+        if self.rate_history.is_empty() {
             self.burst_duration_samples = 0;
             return BurstState::default();
         }
@@ -639,6 +636,21 @@ impl DiskRateEstimator {
         } else {
             sorted[sorted.len() / 2]
         };
+        let (median_consumption_rate, median_drain_rate) = consumption_medians(&self.rate_history);
+        if !calibrated {
+            // A stopped burst can leave an actionable EWMA after only five
+            // samples. Even before burst classification has enough history,
+            // the measured drain can bound that projection. Keep outlier
+            // detection and historical corroboration disabled until calibrated.
+            self.burst_duration_samples = 0;
+            return BurstState {
+                median_rate,
+                median_consumption_rate,
+                median_drain_rate,
+                latest_rate: Some(latest_rate),
+                ..BurstState::default()
+            };
+        }
 
         // MAD (Median Absolute Deviation) × 1.4826 (Gaussian consistency factor).
         // Robust scale estimator: unlike standard deviation, a single 50× burst spike
@@ -689,7 +701,6 @@ impl DiskRateEstimator {
         let burst_probability =
             (deviation_factor * combined_weight / (deviation_factor + 1.0)).clamp(0.0, 1.0);
 
-        let (median_consumption_rate, median_drain_rate) = consumption_medians(&self.rate_history);
         BurstState {
             burst_probability,
             median_rate,
@@ -1468,7 +1479,7 @@ mod tests {
         let reduced = estimator.reforecast(&burst, 0);
         assert!(!reduced.burst_state.calibrated);
         assert_eq!(reduced.burst_state.burst_duration_samples, 0);
-        assert_eq!(reduced.burst_state.latest_rate, None);
+        assert_eq!(reduced.burst_state.latest_rate, Some(50_000.0));
         assert_eq!(reduced.sample_count, burst.sample_count);
         assert_eq!(
             reduced.bytes_per_second.to_bits(),

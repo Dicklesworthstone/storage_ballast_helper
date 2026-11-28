@@ -636,15 +636,14 @@ fn valid_prediction_evidence(estimate: &RateEstimate, current_free_pct: f64) -> 
             .is_none_or(f64::is_finite)
         && estimate.acceleration.is_finite()
         && burst.latest_rate.is_none_or(f64::is_finite)
+        && burst.median_rate.is_finite()
+        && burst.median_rate >= 0.0
+        && burst.median_drain_rate.is_finite()
+        && burst.median_drain_rate >= 0.0
         && estimate.seconds_to_exhaustion.is_finite()
         && estimate.seconds_to_exhaustion >= 0.0
         && (0.0..=100.0).contains(&current_free_pct)
-        && (!burst.calibrated
-            || ((0.0..=1.0).contains(&burst.burst_probability)
-                && burst.median_rate.is_finite()
-                && burst.median_rate >= 0.0
-                && burst.median_drain_rate.is_finite()
-                && burst.median_drain_rate >= 0.0))
+        && (!burst.calibrated || (0.0..=1.0).contains(&burst.burst_probability))
 }
 
 /// Linear interpolation between two values.

@@ -302,6 +302,44 @@ fn ordinary_consumption_retains_its_conformal_early_action() {
 }
 
 #[test]
+fn stopped_burst_cannot_trigger_ballast_release_before_calibration() {
+    // Exercise both a fresh daemon and a history configured below the
+    // calibration minimum. In each, the EWMA still projects seconds to full
+    // after a burst drains 3 GB at 100 MB/s and then stops.
+    for (cap, idle_intervals) in [(200, 12_u64), (20, 35)] {
+        let mut estimator = DiskRateEstimator::with_history_cap(0.3, 0.1, 0.8, 5, cap);
+        let start = Instant::now();
+        let mut free = 3_500_000_000;
+        let mut estimate = estimator.update(free, start, 0);
+        for tick in 1..=idle_intervals + 6 {
+            if tick > idle_intervals {
+                free -= 500_000_000;
+            }
+            estimate = estimator.update(free, start + Duration::from_secs(5 * tick), 0);
+        }
+        let evaluate = |sample: &RateEstimate| policy().evaluate(sample, 9.0, "/data".into());
+        assert!(!estimate.burst_state.calibrated);
+        assert!(evaluate(&estimate).should_release_ballast(), "{estimate:?}");
+
+        let after_burst = start + Duration::from_secs(5 * (idle_intervals + 7));
+        let idle = estimator.update(free, after_burst, 0);
+        assert!(idle.seconds_to_exhaustion < 60.0);
+        assert!(idle.confidence >= PredictiveConfig::default().min_confidence);
+        assert_eq!(evaluate(&idle), PredictiveAction::Clear, "{idle:?}");
+
+        free -= 5_000_000;
+        let slow = estimator.update(free, after_burst + Duration::from_secs(5), 0);
+        assert!(slow.seconds_to_exhaustion < 60.0);
+        match evaluate(&slow) {
+            PredictiveAction::PreemptiveCleanup {
+                minutes_remaining, ..
+            } => assert!((minutes_remaining - 8.25).abs() < 1e-6),
+            action => panic!("expected the slower writer's measured runway: {action:?}; {slow:?}"),
+        }
+    }
+}
+
+#[test]
 fn transient_writer_after_idle_does_not_corroborate_its_residual_forecast() {
     for tail_bytes_per_interval in [0_u64, 4096] {
         let (mut estimator, start, mut free) = estimator_after_idle_burst();
