@@ -13614,14 +13614,16 @@ struct ScanSafety {
     // A no-follow walk through disjoint canonical roots on one mount per device has a
     // unique spelling for each directory. Otherwise an unfinished branch
     // could reveal an alias of any candidate on the same filesystem.
-    isolated_roots: Vec<PathBuf>,
-    root_devices: HashMap<PathBuf, u64>,
+    coverage: crate::scanner::coverage::RootCoverage,
     unclassified_parents: HashMap<PathBuf, bool>,
 }
 
 impl ScanSafety {
     fn new(roots: &[PathBuf], follow_links: bool, platform: &dyn Platform) -> Self {
-        let mut result = Self::default();
+        let mut result = Self {
+            coverage: crate::scanner::coverage::RootCoverage::new(roots, follow_links, platform),
+            ..Self::default()
+        };
         for root in roots {
             result.observe(
                 root,
@@ -13629,79 +13631,6 @@ impl ScanSafety {
                 false,
             );
         }
-        if follow_links {
-            return result;
-        }
-        let Ok(mounts) = platform.mount_points() else {
-            return result;
-        };
-        let mut bindings = Vec::new();
-        for root in roots {
-            let (Ok(real), Ok(id)) = (
-                std::fs::canonicalize(root),
-                crate::scanner::walker::identity_for_path(root, true),
-            ) else {
-                // An unresolved scan root might be another route to any device.
-                return result;
-            };
-            result.root_devices.insert(root.clone(), id.device_id);
-            bindings.push((root, real, id));
-        }
-        // Bind mounts can expose the same directory through an unrelated root.
-        // Mark both the mounted and enclosing devices ambiguous; independent
-        // volumes retain their early dispatch and partial coverage receipts.
-        let mut ambiguous = HashSet::new();
-        let mut owners = HashMap::new();
-        for (_, real, id) in &bindings {
-            if let Some(mount) = mounts
-                .iter()
-                .filter(|mount| real.starts_with(&mount.path))
-                .max_by_key(|mount| mount.path.components().count())
-            {
-                if (cfg!(target_os = "macos") && !mount.fs_type.eq_ignore_ascii_case("apfs"))
-                    || owners
-                        .insert(id.device_id, mount.path.as_path())
-                        .is_some_and(|previous| previous != mount.path)
-                {
-                    ambiguous.insert(id.device_id);
-                }
-            } else {
-                ambiguous.insert(id.device_id);
-            }
-            for mount in &mounts {
-                if mount.path != *real && mount.path.starts_with(real) {
-                    ambiguous.insert(id.device_id);
-                    let Ok(nested) = crate::scanner::walker::identity_for_path(&mount.path, true)
-                    else {
-                        return result;
-                    };
-                    ambiguous.insert(nested.device_id);
-                }
-            }
-        }
-        for (root, real, id) in &bindings {
-            // Two APFS case or Unicode spellings can coincide without sharing a
-            // lexical prefix. Compare the physical identities of the ancestors.
-            let mut ancestry = HashSet::new();
-            for ancestor in real.ancestors().skip(1) {
-                let Ok(parent) = crate::scanner::walker::identity_for_path(ancestor, true) else {
-                    ambiguous.insert(id.device_id);
-                    break;
-                };
-                ancestry.insert(parent);
-            }
-            if bindings
-                .iter()
-                .any(|(other, _, oid)| other != root && (oid == id || ancestry.contains(oid)))
-            {
-                ambiguous.insert(id.device_id);
-            }
-        }
-        result.isolated_roots = bindings
-            .into_iter()
-            .filter(|(_, _, id)| !ambiguous.contains(&id.device_id))
-            .map(|(root, _, _)| root.clone())
-            .collect();
         result
     }
 
@@ -13716,6 +13645,7 @@ impl ScanSafety {
     /// directories. Prove that ancestry before sending a pruned unit early.
     fn isolated_opaque(&mut self, path: &Path, patterns: &ArtifactPatternRegistry) -> bool {
         let Some(root) = self
+            .coverage
             .isolated_roots
             .iter()
             .find(|root| path.starts_with(root))
@@ -13805,46 +13735,7 @@ impl ScanSafety {
             return;
         }
 
-        // Index once: a full scan may rank hundreds of thousands of rows
-        // alongside thousands of independent depth or protection boundaries.
-        let gaps: std::collections::BTreeSet<&Path> = unfinished
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(popped)
-            .collect();
-        let isolated: HashSet<&Path> = self.isolated_roots.iter().map(PathBuf::as_path).collect();
-        let mut every_gap_mapped = true;
-        let mut gap_devices = HashSet::new();
-        for gap in &gaps {
-            let mut devices = gap
-                .ancestors()
-                .filter(|root| isolated.contains(root))
-                .filter_map(|root| self.root_devices.get(root));
-            let Some(&device) = devices.next() else {
-                every_gap_mapped = false;
-                break;
-            };
-            // Cross-device proof needs a different isolated device for each
-            // gap. A gap mapped to multiple devices can satisfy any known ID.
-            if devices.all(|&other| other == device) {
-                gap_devices.insert(device);
-            }
-        }
-
-        ready.extend(pending.into_iter().filter(|row| {
-            let path = row.path.as_path();
-            let overlaps = path.ancestors().any(|ancestor| gaps.contains(ancestor))
-                || gaps
-                    .range(path..)
-                    .next()
-                    .is_some_and(|gap| gap.starts_with(path));
-            !overlaps
-                && (path.ancestors().any(|parent| isolated.contains(parent))
-                    || (every_gap_mapped
-                        && row
-                            .identity
-                            .is_some_and(|id| !gap_devices.contains(&id.device_id))))
-        }));
+        ready.extend(pending.into_iter().filter(self.coverage.covered(unfinished, popped)));
     }
 }
 
@@ -47909,7 +47800,10 @@ mod tests {
     fn scanner_receipts_hold_unseen_or_vetoed_scopes_and_keep_independent_siblings() {
         let path = |p: &str| PathBuf::from(p);
         let mut evidence = ScanSafety {
-            isolated_roots: vec![path("/scratch")],
+            coverage: crate::scanner::coverage::RootCoverage {
+                isolated_roots: vec![path("/scratch")],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let parent = test_candidate("/scratch/cache", 1.0);
@@ -47946,13 +47840,13 @@ mod tests {
         evidence.admit(&mut ready, None);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready.pop().unwrap().path, sibling.path);
-        evidence.isolated_roots.clear();
+        evidence.coverage.isolated_roots.clear();
         evidence.release_covered(&mut ready, rows(), Some(&[path("/unseen/alias")]), None);
         assert!(ready.is_empty(), "an unseen alias can contain the veto");
         let mut other_device = sibling;
         other_device.identity = Some(id);
-        evidence.isolated_roots.push(path("/other-device"));
-        evidence.root_devices.insert(path("/other-device"), 7);
+        evidence.coverage.isolated_roots.push(path("/other-device"));
+        evidence.coverage.root_devices.insert(path("/other-device"), 7);
         evidence.release_covered(
             &mut ready,
             vec![other_device.clone()],
@@ -47977,9 +47871,9 @@ mod tests {
             ("/b", Some(3)),
             ("/other", None),
         ] {
-            safety.isolated_roots.push(path(root));
+            safety.coverage.isolated_roots.push(path(root));
             if let Some(device) = device {
-                safety.root_devices.insert(path(root), device);
+                safety.coverage.root_devices.insert(path(root), device);
             }
         }
         let mut candidates = Vec::new();
@@ -48027,6 +47921,7 @@ mod tests {
                     .iter()
                     .filter(|row| {
                         let isolated = safety
+                            .coverage
                             .isolated_roots
                             .iter()
                             .any(|root| row.path.starts_with(root));
@@ -48038,9 +47933,10 @@ mod tests {
                                 !row.path.starts_with(gap)
                                     && !gap.starts_with(&row.path)
                                     && (isolated
-                                        || safety.isolated_roots.iter().any(|root| {
+                                        || safety.coverage.isolated_roots.iter().any(|root| {
                                             gap.starts_with(root)
                                                 && safety
+                                                    .coverage
                                                     .root_devices
                                                     .get(root)
                                                     .zip(row.identity)

@@ -2,6 +2,7 @@
 
 pub mod active_lease;
 pub mod compression;
+pub mod coverage;
 pub mod decision_record;
 pub mod deletion;
 pub mod engine;

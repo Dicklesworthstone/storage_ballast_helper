@@ -15880,14 +15880,13 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             .collect::<HashSet<_>>(),
         opaque_pruning: matches!(config.scanner.engine, ScannerEngineMode::V2),
     };
-    let walker = DirectoryWalker::new(walker_config, protection);
-    let entries = walker
-        .walk()
+    let walk = storage_ballast_helper::scanner::coverage::CleanupWalk::collect(walker_config, protection)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let entries = &walk.entries;
     let dir_count = entries.len();
 
     // Count protected directories encountered.
-    let protected_count = walker.protection().read().list_protections().len();
+    let protected_count = walk.walker.protection().read().list_protections().len();
 
     // Classify and score each entry with active-reference evidence already
     // attached, so in-use artifacts are vetoed before the deletion plan.
@@ -15905,7 +15904,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut open_paths = None;
     let mut active_reference_index = None;
 
-    let scored: Vec<CandidacyScore> = admit_candidates(
+    let scored: Vec<CandidacyScore> = walk.admit(
         entries
             .iter()
             .filter_map(|entry| {
@@ -18660,10 +18659,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             .collect::<HashSet<_>>(),
         opaque_pruning: matches!(config.scanner.engine, ScannerEngineMode::V2),
     };
-    let walker = DirectoryWalker::new(walker_config, protection);
-    let entries = walker
-        .walk()
+    let walk = storage_ballast_helper::scanner::coverage::CleanupWalk::collect(walker_config, protection)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let entries = &walk.entries;
     let dir_count = entries.len();
 
     // Collect active-reference evidence lazily so tiny emergency candidates do
@@ -18761,7 +18759,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let executor = DeletionExecutor::new(deletion_config, None);
     // A child or alias can carry the veto that protects a whole deletion scope.
     // Admit the complete walk before applying emergency Review eligibility.
-    let plan = executor.plan(admit_candidates(scored));
+    let plan = executor.plan(walk.admit(scored));
 
     if plan.candidates.is_empty() {
         if output_mode(cli) == OutputMode::Human {
@@ -22340,6 +22338,55 @@ mod tests {
         let lines = read_plain_tail_lines(file.path(), 2).expect("tail should read");
 
         assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_cleanup_requires_coverage_without_rejecting_independent_siblings() {
+        use storage_ballast_helper::scanner::coverage::{CleanupWalk, WalkRejection};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let parent = root.join("partial");
+        let safe = root.join("covered");
+        let marked = root.join("outer/hidden");
+        std::fs::create_dir_all(parent.join("unexamined/child")).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&marked).unwrap();
+        std::fs::write(marked.join(".sbh-protect"), "").unwrap();
+        for max_depth in [1, 3] {
+            let walk = CleanupWalk::collect(
+                WalkerConfig {
+                    root_paths: vec![root.to_owned()],
+                    max_depth,
+                    follow_symlinks: false,
+                    cross_devices: false,
+                    parallelism: 2,
+                    excluded_paths: HashSet::new(),
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+            )
+            .unwrap();
+            let outer = root.join("outer");
+            let paths = [&parent, &outer, &safe];
+            let scores: Vec<_> = paths.into_iter().map(|path| {
+                assert!(walk.entries.iter().any(|entry| entry.path == *path));
+                clean_receipt_candidate(path)
+            }).collect();
+            let parent_verdict = if max_depth == 1 {
+                WalkRejection::Uncovered
+            } else {
+                WalkRejection::Admitted
+            };
+            assert_eq!(
+                walk.rejections(&scores),
+                [parent_verdict, WalkRejection::Uncovered, WalkRejection::Admitted]
+            );
+            let allowed = walk.admit(scores);
+            assert!(allowed.iter().any(|row| row.path == safe));
+            assert!(!allowed.iter().any(|row| row.path == root.join("outer")));
+        }
     }
 
     #[cfg(unix)]
